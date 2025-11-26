@@ -10,3 +10,8 @@ pytest-cov>=4.0.0
 
 # Optional: visualization
 matplotlib>=3.7.0
+
+# Web GUI
+flask>=3.0.0
+plotly>=5.18.0
+pillow>=10.0.0

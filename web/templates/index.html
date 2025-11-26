@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DVB-T Pipeline Visualizer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <h1 class="logo">
+                    <span class="logo-icon">📡</span>
+                    DVB-T Pipeline Visualizer
+                </h1>
+                <p class="subtitle">Educational DVB-T Transmitter Chain Visualization</p>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Left Panel: Controls -->
+            <aside class="control-panel">
+                <!-- Upload Section -->
+                <section class="panel-section">
+                    <h2 class="section-title">Input Source</h2>
+                    
+                    <div class="upload-zone" id="uploadZone">
+                        <div class="upload-content">
+                            <span class="upload-icon">📁</span>
+                            <p class="upload-text">Drop image or video here</p>
+                            <p class="upload-hint">JPG, PNG, MP4, AVI (max 32MB)</p>
+                            <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.gif,.bmp,.webp,.mp4,.avi,.mkv,.mov,.webm" hidden>
+                            <button class="btn btn-secondary" onclick="document.getElementById('fileInput').click()">
+                                Browse Files
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="upload-or">
+                        <span>or</span>
+                    </div>
+                    
+                    <button class="btn btn-demo" id="demoBtn">
+                        🎬 Generate Demo Stream
+                    </button>
+                    
+                    <div class="file-info" id="fileInfo" style="display: none;">
+                        <span class="file-name" id="fileName"></span>
+                        <button class="btn-clear" id="clearFile">✕</button>
+                    </div>
+                </section>
+
+                <!-- Parameters Section -->
+                <section class="panel-section">
+                    <h2 class="section-title">DVB-T Parameters</h2>
+                    
+                    <div class="param-group">
+                        <label class="param-label">OFDM Mode</label>
+                        <div class="toggle-group" id="modeToggle">
+                            <button class="toggle-btn active" data-value="2K">2K</button>
+                            <button class="toggle-btn" data-value="8K">8K</button>
+                        </div>
+                    </div>
+
+                    <div class="param-group">
+                        <label class="param-label">Constellation</label>
+                        <select class="param-select" id="constellationSelect">
+                            <option value="QPSK">QPSK (2 bits/symbol)</option>
+                            <option value="16QAM">16-QAM (4 bits/symbol)</option>
+                            <option value="64QAM">64-QAM (6 bits/symbol)</option>
+                        </select>
+                    </div>
+
+                    <div class="param-group">
+                        <label class="param-label">Code Rate</label>
+                        <select class="param-select" id="codeRateSelect">
+                            <option value="1/2">1/2 (most robust)</option>
+                            <option value="2/3">2/3</option>
+                            <option value="3/4">3/4</option>
+                            <option value="5/6">5/6</option>
+                            <option value="7/8">7/8 (highest rate)</option>
+                        </select>
+                    </div>
+
+                    <div class="param-group">
+                        <label class="param-label">Guard Interval</label>
+                        <select class="param-select" id="guardSelect">
+                            <option value="1/4">1/4 (25%)</option>
+                            <option value="1/8">1/8 (12.5%)</option>
+                            <option value="1/16">1/16 (6.25%)</option>
+                            <option value="1/32">1/32 (3.125%)</option>
+                        </select>
+                    </div>
+
+                    <div class="param-group">
+                        <label class="param-label">Bandwidth</label>
+                        <div class="radio-group" id="bandwidthGroup">
+                            <label class="radio-label">
+                                <input type="radio" name="bandwidth" value="6MHz"> 6 MHz
+                            </label>
+                            <label class="radio-label">
+                                <input type="radio" name="bandwidth" value="7MHz"> 7 MHz
+                            </label>
+                            <label class="radio-label">
+                                <input type="radio" name="bandwidth" value="8MHz" checked> 8 MHz
+                            </label>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Stats Section -->
+                <section class="panel-section stats-section" id="statsSection" style="display: none;">
+                    <h2 class="section-title">Statistics</h2>
+                    <div class="stat-grid">
+                        <div class="stat-item">
+                            <span class="stat-value" id="statDataRate">--</span>
+                            <span class="stat-label">Data Rate</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value" id="statSampleRate">--</span>
+                            <span class="stat-label">Sample Rate</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value" id="statPackets">--</span>
+                            <span class="stat-label">TS Packets</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value" id="statDuration">--</span>
+                            <span class="stat-label">Duration</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Actions -->
+                <section class="panel-section">
+                    <button class="btn btn-primary btn-large" id="processBtn" disabled>
+                        <span class="btn-icon">▶</span>
+                        Process Pipeline
+                    </button>
+                    
+                    <button class="btn btn-secondary" id="reprocessBtn" style="display: none;">
+                        🔄 Re-process with New Parameters
+                    </button>
+                    
+                    <button class="btn btn-download" id="downloadBtn" style="display: none;">
+                        💾 Download I/Q Output (.cf32)
+                    </button>
+                </section>
+            </aside>
+
+            <!-- Right Panel: Visualization -->
+            <div class="viz-panel">
+                <!-- Stage Tabs -->
+                <nav class="stage-tabs" id="stageTabs">
+                    <button class="stage-tab active" data-stage="input">
+                        <span class="tab-num">1</span>
+                        <span class="tab-name">Input</span>
+                    </button>
+                    <button class="stage-tab" data-stage="scrambler">
+                        <span class="tab-num">2</span>
+                        <span class="tab-name">Scrambler</span>
+                    </button>
+                    <button class="stage-tab" data-stage="reed_solomon">
+                        <span class="tab-num">3</span>
+                        <span class="tab-name">Reed-Solomon</span>
+                    </button>
+                    <button class="stage-tab" data-stage="convolutional">
+                        <span class="tab-num">4</span>
+                        <span class="tab-name">Convolutional</span>
+                    </button>
+                    <button class="stage-tab" data-stage="puncturing">
+                        <span class="tab-num">5</span>
+                        <span class="tab-name">Puncturing</span>
+                    </button>
+                    <button class="stage-tab" data-stage="qam">
+                        <span class="tab-num">6</span>
+                        <span class="tab-name">QAM</span>
+                    </button>
+                    <button class="stage-tab" data-stage="ofdm">
+                        <span class="tab-num">7</span>
+                        <span class="tab-name">OFDM</span>
+                    </button>
+                    <button class="stage-tab" data-stage="output">
+                        <span class="tab-num">8</span>
+                        <span class="tab-name">Output</span>
+                    </button>
+                </nav>
+
+                <!-- Pipeline Diagram -->
+                <div class="pipeline-diagram" id="pipelineDiagram">
+                    <div class="pipeline-step" data-stage="input">TS</div>
+                    <div class="pipeline-arrow">→</div>
+                    <div class="pipeline-step" data-stage="scrambler">PRBS</div>
+                    <div class="pipeline-arrow">→</div>
+                    <div class="pipeline-step" data-stage="reed_solomon">RS</div>
+                    <div class="pipeline-arrow">→</div>
+                    <div class="pipeline-step" data-stage="convolutional">Conv</div>
+                    <div class="pipeline-arrow">→</div>
+                    <div class="pipeline-step" data-stage="puncturing">Punct</div>
+                    <div class="pipeline-arrow">→</div>
+                    <div class="pipeline-step" data-stage="qam">QAM</div>
+                    <div class="pipeline-arrow">→</div>
+                    <div class="pipeline-step" data-stage="ofdm">OFDM</div>
+                    <div class="pipeline-arrow">→</div>
+                    <div class="pipeline-step" data-stage="output">I/Q</div>
+                </div>
+
+                <!-- Visualization Container -->
+                <div class="viz-container" id="vizContainer">
+                    <div class="viz-placeholder" id="vizPlaceholder">
+                        <div class="placeholder-content">
+                            <span class="placeholder-icon">📊</span>
+                            <h3>No Data Yet</h3>
+                            <p>Upload a file or generate demo data to visualize the DVB-T pipeline</p>
+                        </div>
+                    </div>
+                    <div class="viz-chart" id="vizChart" style="display: none;"></div>
+                    <div class="viz-loading" id="vizLoading" style="display: none;">
+                        <div class="spinner"></div>
+                        <span>Processing...</span>
+                    </div>
+                </div>
+
+                <!-- Stage Info -->
+                <div class="stage-info" id="stageInfo" style="display: none;">
+                    <div class="info-card" id="infoCard">
+                        <h3 class="info-title" id="infoTitle">Stage Information</h3>
+                        <p class="info-desc" id="infoDesc"></p>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>PyDVB - Educational DVB-T Implementation | 
+               <a href="https://en.wikipedia.org/wiki/DVB-T" target="_blank">Learn about DVB-T</a>
+            </p>
+        </footer>
+    </div>
+
+    <script>
+        // State
+        let currentJobId = null;
+        let currentStage = 'input';
+        let hasFile = false;
+        let vizCache = {};
+
+        // Stage descriptions
+        const stageInfo = {
+            input: {
+                title: 'Transport Stream Input',
+                desc: 'MPEG-2 Transport Stream packets (188 bytes each) containing video/audio data. Shows PID distribution and packet statistics.'
+            },
+            scrambler: {
+                title: 'Energy Dispersal (PRBS)',
+                desc: 'XORs data with pseudo-random sequence (x¹⁵+x¹⁴+1) to ensure uniform bit distribution and prevent long runs of identical bits.'
+            },
+            reed_solomon: {
+                title: 'Reed-Solomon RS(204,188)',
+                desc: 'Outer forward error correction adding 16 parity bytes per 188-byte packet. Can correct up to 8 byte errors.'
+            },
+            convolutional: {
+                title: 'Convolutional Encoding',
+                desc: 'Inner FEC with constraint length K=7. Rate 1/2 encoder doubles the bit rate for error protection.'
+            },
+            puncturing: {
+                title: 'Rate Matching (Puncturing)',
+                desc: 'Selectively removes bits to achieve target code rate (2/3, 3/4, 5/6, or 7/8), trading robustness for throughput.'
+            },
+            qam: {
+                title: 'QAM Constellation Mapping',
+                desc: 'Maps bit groups to complex symbols. QPSK=2 bits, 16-QAM=4 bits, 64-QAM=6 bits per symbol.'
+            },
+            ofdm: {
+                title: 'OFDM Modulation',
+                desc: 'Distributes data across multiple carriers with pilot symbols for synchronization. 2K=1705 carriers, 8K=6817 carriers.'
+            },
+            output: {
+                title: 'I/Q Baseband Output',
+                desc: 'Final complex baseband samples ready for transmission via SDR. Shows time-domain waveform and power spectrum.'
+            }
+        };
+
+        // DOM Elements
+        const fileInput = document.getElementById('fileInput');
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const clearFile = document.getElementById('clearFile');
+        const demoBtn = document.getElementById('demoBtn');
+        const processBtn = document.getElementById('processBtn');
+        const reprocessBtn = document.getElementById('reprocessBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const stageTabs = document.getElementById('stageTabs');
+        const vizContainer = document.getElementById('vizContainer');
+        const vizPlaceholder = document.getElementById('vizPlaceholder');
+        const vizChart = document.getElementById('vizChart');
+        const vizLoading = document.getElementById('vizLoading');
+        const statsSection = document.getElementById('statsSection');
+        const stageInfoDiv = document.getElementById('stageInfo');
+        const pipelineDiagram = document.getElementById('pipelineDiagram');
+
+        // Get current parameters
+        function getParams() {
+            const mode = document.querySelector('#modeToggle .toggle-btn.active').dataset.value;
+            const constellation = document.getElementById('constellationSelect').value;
+            const codeRate = document.getElementById('codeRateSelect').value;
+            const guard = document.getElementById('guardSelect').value;
+            const bandwidth = document.querySelector('input[name="bandwidth"]:checked').value;
+            
+            return {
+                mode: mode,
+                constellation: constellation,
+                code_rate: codeRate,
+                guard_interval: guard,
+                bandwidth: bandwidth
+            };
+        }
+
+        // File handling
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                selectFile(e.target.files[0]);
+            }
+        });
+
+        uploadZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadZone.classList.add('dragover');
+        });
+
+        uploadZone.addEventListener('dragleave', () => {
+            uploadZone.classList.remove('dragover');
+        });
+
+        uploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0) {
+                selectFile(e.dataTransfer.files[0]);
+            }
+        });
+
+        clearFile.addEventListener('click', () => {
+            fileInput.value = '';
+            hasFile = false;
+            fileInfo.style.display = 'none';
+            uploadZone.style.display = 'block';
+            processBtn.disabled = true;
+        });
+
+        function selectFile(file) {
+            hasFile = true;
+            fileName.textContent = file.name;
+            fileInfo.style.display = 'flex';
+            uploadZone.style.display = 'none';
+            processBtn.disabled = false;
+        }
+
+        // Mode toggle
+        document.querySelectorAll('#modeToggle .toggle-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('#modeToggle .toggle-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+            });
+        });
+
+        // Demo button
+        demoBtn.addEventListener('click', async () => {
+            showLoading();
+            vizCache = {};
+            
+            try {
+                const params = getParams();
+                const response = await fetch('/api/demo', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(params)
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    alert('Error: ' + data.error);
+                    hideLoading();
+                    return;
+                }
+                
+                currentJobId = data.job_id;
+                updateStats(data.summary);
+                await loadVisualization(currentStage);
+                
+                reprocessBtn.style.display = 'block';
+                downloadBtn.style.display = 'block';
+                
+            } catch (err) {
+                alert('Error: ' + err.message);
+                hideLoading();
+            }
+        });
+
+        // Process button
+        processBtn.addEventListener('click', async () => {
+            if (!hasFile) return;
+            
+            showLoading();
+            vizCache = {};
+            
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            
+            const params = getParams();
+            Object.entries(params).forEach(([key, value]) => {
+                formData.append(key, value);
+            });
+            
+            try {
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    alert('Error: ' + data.error);
+                    hideLoading();
+                    return;
+                }
+                
+                currentJobId = data.job_id;
+                updateStats(data.summary);
+                await loadVisualization(currentStage);
+                
+                reprocessBtn.style.display = 'block';
+                downloadBtn.style.display = 'block';
+                
+            } catch (err) {
+                alert('Error: ' + err.message);
+                hideLoading();
+            }
+        });
+
+        // Reprocess button
+        reprocessBtn.addEventListener('click', async () => {
+            if (!currentJobId) return;
+            
+            showLoading();
+            vizCache = {};
+            
+            try {
+                const params = getParams();
+                const response = await fetch(`/api/reprocess/${currentJobId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(params)
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    alert('Error: ' + data.error);
+                    hideLoading();
+                    return;
+                }
+                
+                currentJobId = data.job_id;
+                updateStats(data.summary);
+                await loadVisualization(currentStage);
+                
+            } catch (err) {
+                alert('Error: ' + err.message);
+                hideLoading();
+            }
+        });
+
+        // Download button
+        downloadBtn.addEventListener('click', () => {
+            if (currentJobId) {
+                window.location.href = `/api/download/${currentJobId}`;
+            }
+        });
+
+        // Stage tabs
+        stageTabs.addEventListener('click', async (e) => {
+            const tab = e.target.closest('.stage-tab');
+            if (!tab) return;
+            
+            const stage = tab.dataset.stage;
+            selectStage(stage);
+            
+            if (currentJobId) {
+                await loadVisualization(stage);
+            }
+        });
+
+        // Pipeline diagram clicks
+        pipelineDiagram.addEventListener('click', async (e) => {
+            const step = e.target.closest('.pipeline-step');
+            if (!step) return;
+            
+            const stage = step.dataset.stage;
+            selectStage(stage);
+            
+            if (currentJobId) {
+                await loadVisualization(stage);
+            }
+        });
+
+        function selectStage(stage) {
+            currentStage = stage;
+            
+            // Update tabs
+            document.querySelectorAll('.stage-tab').forEach(tab => {
+                tab.classList.toggle('active', tab.dataset.stage === stage);
+            });
+            
+            // Update pipeline diagram
+            document.querySelectorAll('.pipeline-step').forEach(step => {
+                step.classList.toggle('active', step.dataset.stage === stage);
+            });
+            
+            // Update info
+            updateStageInfo(stage);
+        }
+
+        function updateStageInfo(stage) {
+            const info = stageInfo[stage];
+            if (info && currentJobId) {
+                document.getElementById('infoTitle').textContent = info.title;
+                document.getElementById('infoDesc').textContent = info.desc;
+                stageInfoDiv.style.display = 'block';
+            }
+        }
+
+        async function loadVisualization(stage) {
+            if (!currentJobId) return;
+            
+            // Check cache
+            if (vizCache[stage]) {
+                renderPlot(vizCache[stage]);
+                return;
+            }
+            
+            showLoading();
+            
+            try {
+                const response = await fetch(`/api/viz/${currentJobId}/${stage}`);
+                const data = await response.json();
+                
+                if (data.error) {
+                    alert('Error loading visualization: ' + data.error);
+                    hideLoading();
+                    return;
+                }
+                
+                vizCache[stage] = data;
+                renderPlot(data);
+                
+            } catch (err) {
+                alert('Error: ' + err.message);
+                hideLoading();
+            }
+        }
+
+        function renderPlot(figData) {
+            vizPlaceholder.style.display = 'none';
+            vizLoading.style.display = 'none';
+            vizChart.style.display = 'block';
+            
+            Plotly.react('vizChart', figData.data, figData.layout, {
+                responsive: true,
+                displayModeBar: true,
+                modeBarButtonsToRemove: ['lasso2d', 'select2d']
+            });
+        }
+
+        function updateStats(summary) {
+            if (!summary) return;
+            
+            document.getElementById('statDataRate').textContent = 
+                (summary.data_rate / 1e6).toFixed(2) + ' Mbps';
+            document.getElementById('statSampleRate').textContent = 
+                (summary.sample_rate / 1e6).toFixed(2) + ' MHz';
+            document.getElementById('statPackets').textContent = 
+                summary.input_packets.toLocaleString();
+            document.getElementById('statDuration').textContent = 
+                (summary.duration * 1000).toFixed(1) + ' ms';
+            
+            statsSection.style.display = 'block';
+        }
+
+        function showLoading() {
+            vizPlaceholder.style.display = 'none';
+            vizChart.style.display = 'none';
+            vizLoading.style.display = 'flex';
+        }
+
+        function hideLoading() {
+            vizLoading.style.display = 'none';
+            if (currentJobId && vizCache[currentStage]) {
+                vizChart.style.display = 'block';
+            } else {
+                vizPlaceholder.style.display = 'flex';
+            }
+        }
+
+        // Initialize
+        selectStage('input');
+    </script>
+</body>
+</html>
+

@@ -10,6 +10,7 @@ PyDVB is a complete, educational implementation of the DVB-T (Digital Video Broa
 - **Full FEC Chain**: Reed-Solomon, convolutional coding, and interleaving
 - **OFDM Modulation**: 2K and 8K modes with proper pilot insertion
 - **Multiple Output Formats**: cf32, cs8, cs16, cu8 for various SDR hardware
+- **Web GUI**: Interactive Flask app with Plotly visualizations for each pipeline stage
 
 ## Architecture
 
@@ -123,6 +124,76 @@ from dvb import OFDMModulator
 ofdm = OFDMModulator('2K')
 time_samples = ofdm.modulate(carrier_values)
 ```
+
+## Web GUI
+
+PyDVB includes a Flask-based web interface for visualizing each stage of the DVB-T pipeline using interactive Plotly charts.
+
+### Running the GUI
+
+```bash
+# Activate virtual environment
+source .venv/bin/activate
+
+# Start the web server
+python web/app.py
+
+# Or specify a port
+python web/app.py --port 5001
+
+# Enable debug mode with auto-reload
+python web/app.py --debug
+
+# Bind to all interfaces (for remote access)
+python web/app.py --host 0.0.0.0 --port 8080
+```
+
+Then open http://localhost:5000 (or your specified port) in your browser.
+
+### Features
+
+- **Upload media files**: Supports JPG, PNG images and MP4, AVI videos (requires ffmpeg)
+- **Demo mode**: Generate synthetic transport stream without file upload
+- **Configurable parameters**: Adjust all DVB-T settings in real-time
+  - Mode: 2K / 8K
+  - Constellation: QPSK / 16QAM / 64QAM
+  - Code Rate: 1/2, 2/3, 3/4, 5/6, 7/8
+  - Guard Interval: 1/4, 1/8, 1/16, 1/32
+  - Bandwidth: 6MHz, 7MHz, 8MHz
+- **Re-process**: Change parameters and re-encode without re-uploading
+- **Download I/Q output**: Export .cf32 files for SDR transmission
+
+### Pipeline Visualizations
+
+Interactive Plotly charts for each processing stage:
+
+| Stage | Visualization |
+|-------|---------------|
+| Input | TS packet analysis, PID distribution |
+| Scrambler | Bit distribution before/after energy dispersal |
+| Reed-Solomon | Codeword structure with parity bytes |
+| Convolutional | Input/output bit stream comparison |
+| Puncturing | Rate matching pattern visualization |
+| QAM | Constellation diagram (QPSK/16QAM/64QAM) |
+| OFDM | Carrier spectrum with pilot positions |
+| Output | I/Q waveform and power spectral density |
+
+### Optional: ffmpeg for Media Conversion
+
+To encode images and videos, install ffmpeg:
+
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
+
+# Windows
+# Download from https://ffmpeg.org/download.html
+```
+
+Without ffmpeg, the demo mode still works using synthetic data.
 
 ## Module Structure
 
