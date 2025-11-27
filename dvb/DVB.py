@@ -269,57 +269,112 @@ class DVBTDemodulator:
     """
     DVB-T demodulator (receiver).
     
-    Implements the receive chain to recover transport stream
-    from baseband I/Q samples.
+    Implements the complete receive chain to recover transport stream
+    from baseband I/Q samples, including:
+    - Synchronization (time, frequency, frame)
+    - Channel estimation and equalization
+    - OFDM demodulation
+    - FEC decoding
     
-    Note: This is a simplified demodulator without channel estimation
-    or synchronization. It's primarily for educational/testing purposes.
+    Attributes:
+        mode: '2K' or '8K' (or 'auto' for detection)
+        constellation: 'QPSK', '16QAM', '64QAM'
+        code_rate: '1/2', '2/3', '3/4', '5/6', '7/8'
+        guard_interval: '1/4', '1/8', '1/16', '1/32'
+        
+    Example:
+        >>> demod = DVBTDemodulator(mode='2K', constellation='64QAM')
+        >>> ts_data, stats = demod.demodulate(iq_samples)
+        >>> 
+        >>> # Auto-detect parameters
+        >>> demod = DVBTDemodulator(mode='auto')
+        >>> ts_data, stats = demod.demodulate(iq_samples)
     """
     
     def __init__(self, mode: str = '2K', constellation: str = 'QPSK',
-                 code_rate: str = '1/2', guard_interval: str = '1/4'):
+                 code_rate: str = '1/2', guard_interval: str = '1/4',
+                 bandwidth: str = '8MHz',
+                 equalization: str = 'zf',
+                 soft_decision: bool = False):
         """
         Initialize DVB-T demodulator.
         
         Args:
-            mode: OFDM mode
+            mode: OFDM mode ('2K', '8K', or 'auto')
             constellation: Expected modulation
             code_rate: Expected FEC rate
             guard_interval: Expected guard interval
+            bandwidth: Channel bandwidth for sample rate
+            equalization: Equalization method ('zf' or 'mmse')
+            soft_decision: Use soft decision decoding
         """
         self.mode = mode
         self.constellation = constellation
         self.code_rate = code_rate
         self.guard_interval = guard_interval
+        self.bandwidth = bandwidth
+        self.equalization = equalization
+        self.soft_decision = soft_decision
         
-        self._init_stages()
+        # Sample rate
+        sample_rates = {
+            '8MHz': 9142857.142857143,
+            '7MHz': 8000000.0,
+            '6MHz': 6857142.857142857,
+        }
+        self.sample_rate = sample_rates.get(bandwidth, sample_rates['8MHz'])
+        
+        # Auto-detect flag
+        self._auto_detect = (mode == 'auto')
+        
+        if not self._auto_detect:
+            self._init_stages()
     
     def _init_stages(self) -> None:
         """Initialize demodulation stages."""
         from .OFDM import OFDMDemodulator
         from .GuardInterval import GuardIntervalRemover
         from .Pilots import PilotExtractor
+        from .Synchronizer import DVBTSynchronizer
+        from .ChannelEstimator import ChannelEstimatorWithEqualization
         
-        # OFDM demodulation
+        # FFT parameters
         fft_sizes = {'2K': 2048, '8K': 8192}
         self.fft_size = fft_sizes[self.mode]
         
+        # Synchronization
+        self.synchronizer = DVBTSynchronizer(
+            self.mode, self.guard_interval, self.sample_rate
+        )
+        
+        # Guard interval removal
         self.guard_remover = GuardIntervalRemover(self.guard_interval, self.fft_size)
+        
+        # OFDM demodulation
         self.ofdm_demod = OFDMDemodulator(self.mode)
+        
+        # Channel estimation and equalization
+        self.channel_eq = ChannelEstimatorWithEqualization(
+            self.mode, 
+            interpolation='linear',
+            method=self.equalization
+        )
+        
+        # Pilot extraction
         self.pilot_extractor = PilotExtractor(self.mode)
         
         # Symbol deinterleaving
         self.symbol_deinterleaver = SymbolInterleaver(self.mode)
         
         # QAM demapping
-        self.qam_demapper = QAMDemapper(self.constellation)
+        self.qam_demapper = QAMDemapper(self.constellation, self.soft_decision)
         
         # Bit deinterleaving
         self.bit_deinterleaver = BitInterleaver(self.constellation, self.mode)
         
         # Inner FEC
         self.depuncturer = Depuncturer(self.code_rate)
-        self.conv_decoder = ConvolutionalDecoder()
+        self.conv_decoder = ConvolutionalDecoder(self.soft_decision)
         
         # Outer deinterleaving
         from .OuterInterleaver import OuterDeinterleaver
@@ -331,6 +386,21 @@ class DVBTDemodulator:
         # Descrambling
         self.descrambler = Scrambler()
     
+    def _auto_detect_params(self, iq_samples: np.ndarray) -> None:
+        """Auto-detect DVB-T parameters from signal."""
+        from .Detector import DVBTDetector
+        
+        detector = DVBTDetector(self.sample_rate)
+        params = detector.detect(iq_samples)
+        
+        self.mode = params.mode
+        self.guard_interval = params.guard_interval
+        self.constellation = params.constellation
+        self.code_rate = params.code_rate
+        
+        self._init_stages()
+        self._auto_detect = False
+    
     def demodulate(self, iq_samples: np.ndarray) -> Tuple[bytes, dict]:
         """
         Demodulate I/Q samples to transport stream.
@@ -341,67 +411,106 @@ class DVBTDemodulator:
         Returns:
             Tuple of (recovered TS data, statistics dict)
         """
-        stats = {'symbols': 0, 'rs_errors': 0, 'rs_uncorrectable': 0}
+        # Auto-detect if needed
+        if self._auto_detect:
+            self._auto_detect_params(iq_samples)
+        
+        stats = {
+            'symbols': 0, 
+            'rs_errors': 0, 
+            'rs_uncorrectable': 0,
+            'snr_db': 0.0,
+            'cfo_hz': 0.0,
+            'packets_recovered': 0,
+        }
+        
+        # Step 1: Synchronization
+        sync_result = self.synchronizer.synchronize(iq_samples)
+        stats['cfo_hz'] = sync_result.coarse_cfo
+        stats['snr_db'] = sync_result.snr_estimate
+        
+        # Apply CFO correction
+        corrected_samples = self.synchronizer.coarse.correct_cfo(
+            iq_samples, sync_result.coarse_cfo
+        )
+        
+        # Align to symbol boundary
+        aligned_samples = corrected_samples[sync_result.symbol_start:]
         
         # Calculate symbol length
         symbol_len = self.fft_size + self.guard_remover.guard_length
-        num_symbols = len(iq_samples) // symbol_len
+        num_symbols = len(aligned_samples) // symbol_len
         
         if num_symbols == 0:
             return b'', stats
         
         stats['symbols'] = num_symbols
         
-        # Process symbols
+        # Step 2: Process symbols
         all_data = []
+        self.channel_eq.reset()
         
         for sym_idx in range(num_symbols):
             start = sym_idx * symbol_len
-            symbol_samples = iq_samples[start:start + symbol_len]
+            symbol_samples = aligned_samples[start:start + symbol_len]
             
             # Remove guard interval
             useful = self.guard_remover.remove(symbol_samples)
             
-            # OFDM demodulation
+            # OFDM demodulation (FFT)
             carriers = self.ofdm_demod.demodulate(useful)
+            
+            # Channel estimation and equalization
+            equalized, csi = self.channel_eq.process(carriers, sym_idx % 68)
+            
+            # Fine frequency/phase correction using pilots
+            fine_cfo, phase = self.synchronizer.refine_sync(equalized, sym_idx % 68)
+            equalized = self.synchronizer.fine.correct_phase(equalized, phase)
             
             # Extract data carriers (remove pilots)
             data_carriers, _, _ = self.pilot_extractor.extract(
-                carriers, sym_idx % 68
+                equalized, sym_idx % 68
             )
             
             all_data.append(data_carriers)
         
-        # Concatenate all data
+        # Concatenate all data carriers
         data_carriers = np.concatenate(all_data)
         
-        # Symbol deinterleave
-        from .InnerInterleaver import SymbolInterleaver
-        sym_deint = SymbolInterleaver(self.mode)
-        deinterleaved = sym_deint.deinterleave(data_carriers)
+        # Step 3: Symbol deinterleaving
+        deinterleaved = self.symbol_deinterleaver.deinterleave(data_carriers)
         
-        # QAM demap
-        bits = self.qam_demapper.demap(deinterleaved)
+        # Step 4: QAM demapping
+        if self.soft_decision:
+            llrs = self.qam_demapper.demap(deinterleaved)
+            bits = llrs
+        else:
+            bits = self.qam_demapper.demap(deinterleaved)
         
-        # Bit deinterleave
+        # Step 5: Bit deinterleaving
         bits = self.bit_deinterleaver.deinterleave(bits)
         
-        # Depuncture
+        # Step 6: Depuncturing
         depunctured = self.depuncturer.depuncture(bits.astype(np.float32))
         
-        # Viterbi decode
-        decoded = self.conv_decoder.decode(
-            (depunctured > 0.5).astype(np.uint8),
-            terminated=False
-        )
+        # Step 7: Viterbi decoding
+        if self.soft_decision:
+            # Soft decision: use LLRs directly
+            decoded = self.conv_decoder.decode(depunctured, terminated=False)
+        else:
+            # Hard decision
+            decoded = self.conv_decoder.decode(
+                (depunctured > 0.5).astype(np.uint8),
+                terminated=False
+            )
         
         # Convert bits to bytes
         byte_data = np.packbits(decoded).tobytes()
         
-        # Outer deinterleave
+        # Step 8: Outer deinterleaving
         deinterleaved = self.outer_deinterleaver.process(byte_data)
         
-        # RS decode
+        # Step 9: RS decoding
         recovered = bytearray()
         num_codewords = len(deinterleaved) // 204
         
@@ -416,10 +525,142 @@ class DVBTDemodulator:
             
             recovered.extend(decoded_pkt)
         
-        # Descramble
+        # Step 10: Descrambling
         ts_data = self.descrambler.descramble(bytes(recovered))
         
+        stats['packets_recovered'] = len(ts_data) // 188
+        
         return ts_data, stats
+    
+    def demodulate_file(self, input_path: Union[str, Path],
+                        output_path: Optional[Union[str, Path]] = None,
+                        format: str = 'auto') -> Tuple[bytes, dict]:
+        """
+        Demodulate I/Q file to transport stream.
+        
+        Args:
+            input_path: Path to input I/Q file
+            output_path: Optional path to write TS output
+            format: I/Q format ('cf32', 'cs8', etc. or 'auto')
+            
+        Returns:
+            Tuple of (TS data, statistics)
+        """
+        from .IQReader import IQReader
+        
+        reader = IQReader(format, self.sample_rate)
+        iq_samples = reader.read(input_path)
+        
+        ts_data, stats = self.demodulate(iq_samples)
+        
+        if output_path:
+            with open(output_path, 'wb') as f:
+                f.write(ts_data)
+        
+        return ts_data, stats
+    
+    def iter_demodulate(self, iq_samples: np.ndarray,
+                        frames_per_chunk: int = 1) -> Iterator[Tuple[bytes, dict]]:
+        """
+        Demodulate in chunks for streaming processing.
+        
+        Args:
+            iq_samples: Input I/Q samples
+            frames_per_chunk: Number of frames per output chunk
+            
+        Yields:
+            Tuple of (TS chunk, statistics)
+        """
+        # Auto-detect if needed (uses first chunk)
+        if self._auto_detect:
+            self._auto_detect_params(iq_samples)
+        
+        symbol_len = self.fft_size + self.guard_remover.guard_length
+        symbols_per_frame = 68
+        samples_per_frame = symbol_len * symbols_per_frame
+        samples_per_chunk = samples_per_frame * frames_per_chunk
+        
+        # Initial sync
+        sync_result = self.synchronizer.synchronize(iq_samples)
+        corrected = self.synchronizer.coarse.correct_cfo(
+            iq_samples, sync_result.coarse_cfo
+        )
+        aligned = corrected[sync_result.symbol_start:]
+        
+        # Process in chunks
+        for chunk_start in range(0, len(aligned) - samples_per_chunk, samples_per_chunk):
+            chunk = aligned[chunk_start:chunk_start + samples_per_chunk]
+            ts_data, stats = self._demodulate_chunk(chunk, chunk_start // symbol_len)
+            yield ts_data, stats
+    
+    def _demodulate_chunk(self, samples: np.ndarray, 
+                          start_symbol: int) -> Tuple[bytes, dict]:
+        """Demodulate a chunk of samples (internal)."""
+        stats = {'symbols': 0, 'rs_errors': 0, 'rs_uncorrectable': 0}
+        
+        symbol_len = self.fft_size + self.guard_remover.guard_length
+        num_symbols = len(samples) // symbol_len
+        
+        if num_symbols == 0:
+            return b'', stats
+        
+        stats['symbols'] = num_symbols
+        all_data = []
+        
+        for sym_idx in range(num_symbols):
+            frame_sym_idx = (start_symbol + sym_idx) % 68
+            start = sym_idx * symbol_len
+            symbol_samples = samples[start:start + symbol_len]
+            
+            useful = self.guard_remover.remove(symbol_samples)
+            carriers = self.ofdm_demod.demodulate(useful)
+            equalized, _ = self.channel_eq.process(carriers, frame_sym_idx)
+            
+            _, phase = self.synchronizer.refine_sync(equalized, frame_sym_idx)
+            equalized = self.synchronizer.fine.correct_phase(equalized, phase)
+            
+            data_carriers, _, _ = self.pilot_extractor.extract(equalized, frame_sym_idx)
+            all_data.append(data_carriers)
+        
+        data_carriers = np.concatenate(all_data)
+        deinterleaved = self.symbol_deinterleaver.deinterleave(data_carriers)
+        bits = self.qam_demapper.demap(deinterleaved)
+        bits = self.bit_deinterleaver.deinterleave(bits)
+        depunctured = self.depuncturer.depuncture(bits.astype(np.float32))
+        decoded = self.conv_decoder.decode(
+            (depunctured > 0.5).astype(np.uint8), terminated=False
+        )
+        
+        byte_data = np.packbits(decoded).tobytes()
+        deinterleaved = self.outer_deinterleaver.process(byte_data)
+        
+        recovered = bytearray()
+        num_codewords = len(deinterleaved) // 204
+        
+        for i in range(num_codewords):
+            codeword = deinterleaved[i * 204:(i + 1) * 204]
+            decoded_pkt, errors = self.rs_decoder.decode(codeword)
+            
+            if errors < 0:
+                stats['rs_uncorrectable'] += 1
+            elif errors > 0:
+                stats['rs_errors'] += errors
+            
+            recovered.extend(decoded_pkt)
+        
+        ts_data = self.descrambler.descramble(bytes(recovered))
+        return ts_data, stats
+    
+    def get_sample_rate(self) -> float:
+        """Get expected sample rate in Hz."""
+        return self.sample_rate
+    
+    def reset(self) -> None:
+        """Reset demodulator state."""
+        if hasattr(self, 'channel_eq'):
+            self.channel_eq.reset()
+        if hasattr(self, 'synchronizer'):
+            self.synchronizer.fine._last_phase = 0.0
 
 
 def modulate(ts_data: Union[bytes, TransportStream],
