@@ -26,7 +26,7 @@ class TPSEncoder:
     modulated onto TPS pilot carriers.
     
     Attributes:
-        frame_size: Number of OFDM symbols per frame (68)
+        frame_size: Number of OFDM symbols per frame (68 for 2K/8K, 16 for audio)
         tps_bits_per_frame: Total TPS bits per frame
         
     Example:
@@ -37,6 +37,7 @@ class TPSEncoder:
     
     # Frame structure
     SYMBOLS_PER_FRAME = 68
+    SYMBOLS_PER_FRAME_AUDIO = 16
     TPS_BITS_PER_SYMBOL = 1  # One bit per TPS carrier per symbol
     
     # TPS bit positions within frame
@@ -84,27 +85,41 @@ class TPSEncoder:
         '1/16': 0b01,
         '1/8': 0b10,
         '1/4': 0b11,
+        'acoustic': 0b11,  # Uses same code as 1/4 for TPS (custom mode)
     }
     
     # Transmission mode codes
     MODE_CODES = {
         '2K': 0b00,
         '8K': 0b01,
+        'audio': 0b10,  # Audio mode code
     }
     
     # Sync words for even and odd frames
     SYNC_EVEN = 0b0011010111101110
     SYNC_ODD = 0b1100101000010001
     
+    # Simplified sync for audio mode (4 bits)
+    SYNC_AUDIO_EVEN = 0b0101
+    SYNC_AUDIO_ODD = 0b1010
+    
     def __init__(self, mode: str = '2K'):
         """
         Initialize TPS encoder.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
         """
         self.mode = mode
-        self.num_tps_carriers = 17 if mode == '2K' else 68
+        if mode == 'audio':
+            self.num_tps_carriers = 4
+            self.symbols_per_frame = self.SYMBOLS_PER_FRAME_AUDIO
+        elif mode == '2K':
+            self.num_tps_carriers = 17
+            self.symbols_per_frame = self.SYMBOLS_PER_FRAME
+        else:  # 8K
+            self.num_tps_carriers = 68
+            self.symbols_per_frame = self.SYMBOLS_PER_FRAME
         
         # Default parameters
         self._params = {
@@ -239,14 +254,17 @@ class TPSEncoder:
     
     def encode_frame(self, frame_number: int = 0) -> np.ndarray:
         """
-        Encode TPS for one frame (68 symbols).
+        Encode TPS for one frame.
         
         Args:
             frame_number: Frame number within superframe (0-3)
             
         Returns:
-            Array of TPS bits per symbol (68 bits)
+            Array of TPS bits per symbol (68 bits for 2K/8K, 16 for audio)
         """
+        if self.mode == 'audio':
+            return self._encode_frame_audio(frame_number)
+        
         # Pack TPS data
         tps_data = self._pack_tps_data(frame_number)
         
@@ -265,6 +283,52 @@ class TPSEncoder:
         
         return frame_bits
     
+    def _encode_frame_audio(self, frame_number: int) -> np.ndarray:
+        """
+        Encode simplified TPS for audio mode (16 symbols).
+        
+        Audio mode uses a simpler TPS structure:
+        - Symbol 0: Reference
+        - Symbols 1-4: Sync pattern
+        - Symbols 5-6: Frame number
+        - Symbols 7-8: Constellation
+        - Symbols 9-11: Code rate
+        - Symbols 12-13: Guard interval  
+        - Symbols 14-15: Reserved/parity
+        """
+        frame_bits = np.zeros(16, dtype=np.uint8)
+        frame_bits[0] = 0  # Reference
+        
+        # Simplified sync (4 bits)
+        sync = self.SYNC_AUDIO_EVEN if frame_number % 2 == 0 else self.SYNC_AUDIO_ODD
+        for i in range(4):
+            frame_bits[1 + i] = (sync >> (3 - i)) & 1
+        
+        # Frame number (2 bits)
+        for i in range(2):
+            frame_bits[5 + i] = (frame_number >> (1 - i)) & 1
+        
+        # Constellation (2 bits)
+        const_code = self.CONSTELLATION_CODES[self._params['constellation']]
+        for i in range(2):
+            frame_bits[7 + i] = (const_code >> (1 - i)) & 1
+        
+        # Code rate (3 bits)
+        hp_code = self.CODE_RATE_CODES[self._params['hp_code_rate']]
+        for i in range(3):
+            frame_bits[9 + i] = (hp_code >> (2 - i)) & 1
+        
+        # Guard interval (2 bits)
+        guard_code = self.GUARD_INTERVAL_CODES[self._params['guard_interval']]
+        for i in range(2):
+            frame_bits[12 + i] = (guard_code >> (1 - i)) & 1
+        
+        # Simple parity (XOR of all previous bits)
+        frame_bits[14] = np.sum(frame_bits[:14]) % 2
+        frame_bits[15] = frame_bits[14] ^ 1  # Complement for robustness
+        
+        return frame_bits
+    
     def get_symbol_tps(self, symbol_index: int, 
                        frame_tps: np.ndarray) -> np.ndarray:
         """
@@ -274,14 +338,17 @@ class TPSEncoder:
         (with different PRBS modulation applied by pilot inserter).
         
         Args:
-            symbol_index: Symbol number (0-67)
+            symbol_index: Symbol number (0-67 for 2K/8K, 0-15 for audio)
             frame_tps: Frame TPS bits from encode_frame()
             
         Returns:
             Array of TPS bits for each TPS carrier
         """
+        # Handle symbol index wrapping for different frame sizes
+        idx = symbol_index % self.symbols_per_frame
+        
         # All TPS carriers carry the same bit
-        bit = frame_tps[symbol_index]
+        bit = frame_tps[idx] if idx < len(frame_tps) else 0
         return np.full(self.num_tps_carriers, bit, dtype=np.uint8)
 
 
@@ -298,21 +365,29 @@ class TPSDecoder:
         Initialize TPS decoder.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
         """
         self.mode = mode
-        self.num_tps_carriers = 17 if mode == '2K' else 68
+        if mode == 'audio':
+            self.num_tps_carriers = 4
+        elif mode == '2K':
+            self.num_tps_carriers = 17
+        else:
+            self.num_tps_carriers = 68
     
     def decode_frame(self, frame_tps: np.ndarray) -> Optional[Dict]:
         """
         Decode TPS from one frame.
         
         Args:
-            frame_tps: Received TPS bits (68 bits, after DBPSK demod)
+            frame_tps: Received TPS bits (68 bits for 2K/8K, 16 for audio)
             
         Returns:
             Dict of decoded parameters, or None if decode failed
         """
+        if self.mode == 'audio':
+            return self._decode_frame_audio(frame_tps)
+        
         if len(frame_tps) != 68:
             return None
         
@@ -366,5 +441,48 @@ class TPSDecoder:
             'guard_interval': guard_map.get(guard_code, 'unknown'),
             'mode': mode_map.get(mode_code, 'unknown'),
             'cell_id': cell_id,
+            'frame_number': frame_num,
+        }
+    
+    def _decode_frame_audio(self, frame_tps: np.ndarray) -> Optional[Dict]:
+        """Decode simplified TPS for audio mode."""
+        if len(frame_tps) < 16:
+            return None
+        
+        # Check sync pattern
+        sync = 0
+        for i in range(4):
+            sync = (sync << 1) | frame_tps[1 + i]
+        
+        if sync == TPSEncoder.SYNC_AUDIO_EVEN:
+            pass  # Valid even frame
+        elif sync == TPSEncoder.SYNC_AUDIO_ODD:
+            pass  # Valid odd frame
+        else:
+            return None  # Invalid sync
+        
+        def decode_bits(start, length):
+            val = 0
+            for i in range(length):
+                val = (val << 1) | frame_tps[start + i]
+            return val
+        
+        frame_num = decode_bits(5, 2)
+        const_code = decode_bits(7, 2)
+        hp_code = decode_bits(9, 3)
+        guard_code = decode_bits(12, 2)
+        
+        const_map = {v: k for k, v in TPSEncoder.CONSTELLATION_CODES.items()}
+        rate_map = {v: k for k, v in TPSEncoder.CODE_RATE_CODES.items()}
+        guard_map = {v: k for k, v in TPSEncoder.GUARD_INTERVAL_CODES.items()}
+        
+        return {
+            'constellation': const_map.get(const_code, 'QPSK'),
+            'hierarchy': 'non-hierarchical',
+            'hp_code_rate': rate_map.get(hp_code, '1/2'),
+            'lp_code_rate': rate_map.get(hp_code, '1/2'),
+            'guard_interval': guard_map.get(guard_code, '1/4'),
+            'mode': 'audio',
+            'cell_id': 0,
             'frame_number': frame_num,
         }

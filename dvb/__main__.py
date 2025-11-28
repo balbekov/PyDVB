@@ -5,6 +5,10 @@ Usage:
     python -m dvb info <file.ts>           # Show TS file information
     python -m dvb demux <file.ts> -o dir/  # Extract elementary streams
     python -m dvb modulate <file.ts> -o output.cf32  # Modulate to I/Q
+    python -m dvb audio-tx <file.ts>       # Transmit via audio speaker
+    python -m dvb audio-rx -d 10           # Receive from microphone for 10s
+    python -m dvb send-image photo.jpg     # Send image via audio
+    python -m dvb receive-image -d 10      # Receive image from audio
     
 Examples:
     # Show transport stream information
@@ -16,6 +20,25 @@ Examples:
     
     # Play on HackRF (requires hackrf_transfer)
     hackrf_transfer -t output.cs8 -f 474e6 -s 9142857 -x 40
+    
+    # Transmit transport stream via audio
+    python -m dvb audio-tx sample.ts --output audio.wav  # Save to file
+    python -m dvb audio-tx sample.ts --play              # Play through speaker
+    
+    # Receive from microphone and decode
+    python -m dvb audio-rx -d 10 -o received.ts          # Record 10 seconds
+    python -m dvb audio-rx -i recording.wav -o out.ts    # Decode WAV file
+    
+    # Send image via acoustic channel
+    python -m dvb send-image photo.jpg --output audio.wav  # Save to WAV
+    python -m dvb send-image photo.jpg --play              # Play through speaker
+    
+    # Receive image via acoustic channel
+    python -m dvb receive-image -d 15 -o received.jpg      # Record 15 seconds
+    python -m dvb receive-image -i audio.wav -o out.jpg    # Decode WAV file
+    
+    # Test image loopback (TX -> WAV -> RX)
+    python -m dvb image-loopback photo.jpg -o recovered.jpg
 """
 
 import argparse
@@ -263,6 +286,442 @@ def cmd_generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audio_tx(args: argparse.Namespace) -> int:
+    """Transmit transport stream via audio."""
+    from .AudioOutput import AudioOutput, AcousticDVBT
+    
+    input_path = Path(args.file)
+    
+    if not input_path.exists():
+        print(f"Error: File not found: {input_path}", file=sys.stderr)
+        return 1
+    
+    # Read input
+    print(f"Reading: {input_path}")
+    with open(input_path, 'rb') as f:
+        ts_data = f.read()
+    
+    print(f"Input size: {len(ts_data):,} bytes")
+    print(f"Packets: {len(ts_data) // 188:,}")
+    print()
+    
+    # Configure acoustic transmitter
+    print("Acoustic DVB-T Parameters:")
+    print(f"  Audio sample rate: {args.sample_rate} Hz")
+    print(f"  Carrier frequency: {args.carrier} Hz")
+    print(f"  Mode: QPSK, Code rate 1/2 (robust)")
+    print()
+    
+    # Create transmitter
+    tx = AcousticDVBT(
+        audio_sample_rate=args.sample_rate,
+        carrier_freq=args.carrier,
+        amplitude=args.amplitude
+    )
+    
+    if args.output:
+        # Write to WAV file
+        output_path = Path(args.output)
+        print(f"Modulating to audio file: {output_path}")
+        tx.transmit_to_file(ts_data, output_path)
+        print(f"Wrote: {output_path}")
+    
+    if args.play:
+        # Play through speaker
+        print("Playing through speaker...")
+        try:
+            tx.transmit(ts_data, blocking=True)
+            print("Playback complete.")
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            print("Install sounddevice: pip install sounddevice", file=sys.stderr)
+            return 1
+    
+    if not args.output and not args.play:
+        print("No output specified. Use --output FILE.wav or --play")
+        return 1
+    
+    tx.close()
+    return 0
+
+
+def cmd_audio_rx(args: argparse.Namespace) -> int:
+    """Receive DVB-T from audio input."""
+    from .AudioInput import AudioInput, AcousticDVBTReceiver
+    
+    # Create receiver
+    rx = AcousticDVBTReceiver(
+        audio_sample_rate=args.sample_rate,
+        carrier_freq=args.carrier
+    )
+    
+    print("Acoustic DVB-T Receiver")
+    print(f"  Audio sample rate: {args.sample_rate} Hz")
+    print(f"  Carrier frequency: {args.carrier} Hz")
+    print()
+    
+    if args.input:
+        # Decode from WAV file
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"Error: File not found: {input_path}", file=sys.stderr)
+            return 1
+        
+        print(f"Decoding from: {input_path}")
+        ts_data, stats = rx.receive_file(input_path)
+    
+    else:
+        # Record from microphone
+        duration = args.duration
+        if duration <= 0:
+            print("Error: Duration must be positive", file=sys.stderr)
+            return 1
+        
+        print(f"Recording for {duration} seconds...")
+        try:
+            ts_data, stats = rx.receive(duration)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            print("Install sounddevice: pip install sounddevice", file=sys.stderr)
+            return 1
+    
+    # Show stats
+    print()
+    print("Reception Statistics:")
+    print(f"  Symbols processed: {stats.get('symbols', 0):,}")
+    print(f"  RS errors corrected: {stats.get('rs_errors', 0)}")
+    print(f"  RS uncorrectable: {stats.get('rs_uncorrectable', 0)}")
+    print(f"  SNR estimate: {stats.get('snr_db', 0):.1f} dB")
+    print(f"  Packets recovered: {stats.get('packets_recovered', 0)}")
+    print(f"  Data recovered: {len(ts_data):,} bytes")
+    print()
+    
+    # Write output
+    if args.output and len(ts_data) > 0:
+        output_path = Path(args.output)
+        with open(output_path, 'wb') as f:
+            f.write(ts_data)
+        print(f"Wrote: {output_path}")
+    elif len(ts_data) == 0:
+        print("No data recovered. Signal may be too weak or corrupted.")
+    
+    rx.close()
+    return 0
+
+
+def cmd_audio_loopback(args: argparse.Namespace) -> int:
+    """Test audio loopback (TX -> file -> RX)."""
+    from .AudioOutput import AcousticDVBT
+    from .AudioInput import AcousticDVBTReceiver
+    import tempfile
+    
+    # Generate test data
+    print("Generating test transport stream...")
+    from .TransportStream import TransportStream
+    from .Packet import Packet
+    
+    ts = TransportStream()
+    for i in range(args.packets):
+        ts.append(Packet(
+            pid=0x100,
+            payload=bytes([(i * j) % 256 for j in range(184)]),
+            continuity_counter=i % 16,
+        ))
+    
+    ts_data = ts.to_bytes()
+    print(f"Generated {len(ts_data)} bytes ({args.packets} packets)")
+    
+    # Create temp WAV file
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+        wav_path = Path(tmp.name)
+    
+    try:
+        # Transmit to WAV
+        print(f"\nTransmitting to: {wav_path}")
+        tx = AcousticDVBT(
+            audio_sample_rate=args.sample_rate,
+            carrier_freq=args.carrier
+        )
+        tx.transmit_to_file(ts_data, wav_path)
+        tx.close()
+        
+        print(f"WAV file size: {wav_path.stat().st_size:,} bytes")
+        
+        # Receive from WAV
+        print("\nReceiving from WAV file...")
+        rx = AcousticDVBTReceiver(
+            audio_sample_rate=args.sample_rate,
+            carrier_freq=args.carrier
+        )
+        recovered_data, stats = rx.receive_file(wav_path)
+        rx.close()
+        
+        # Compare
+        print("\nResults:")
+        print(f"  Original:  {len(ts_data):,} bytes")
+        print(f"  Recovered: {len(recovered_data):,} bytes")
+        print(f"  RS errors: {stats.get('rs_errors', 0)}")
+        print(f"  RS uncorrectable: {stats.get('rs_uncorrectable', 0)}")
+        
+        if len(recovered_data) > 0:
+            # Check how much matches
+            match_len = min(len(ts_data), len(recovered_data))
+            matches = sum(1 for i in range(match_len) 
+                         if ts_data[i] == recovered_data[i])
+            print(f"  Byte match: {matches}/{match_len} ({100*matches/match_len:.1f}%)")
+        
+    finally:
+        # Clean up
+        if wav_path.exists():
+            wav_path.unlink()
+    
+    return 0
+
+
+def cmd_send_image(args: argparse.Namespace) -> int:
+    """Send image via audio using DVB-T audio mode."""
+    from .ImageTransport import send_image_audio
+    
+    image_path = Path(args.file)
+    
+    if not image_path.exists():
+        print(f"Error: File not found: {image_path}", file=sys.stderr)
+        return 1
+    
+    print(f"Image: {image_path}")
+    print(f"Size: {image_path.stat().st_size:,} bytes")
+    print()
+    
+    print("DVB-T Audio Mode Parameters:")
+    print(f"  Sample rate: {args.sample_rate} Hz")
+    print(f"  Mode: audio (64-pt FFT, 24 carriers, 6kHz BW)")
+    print(f"  Modulation: QPSK with FEC")
+    print()
+    
+    if args.output:
+        output_path = Path(args.output)
+        print(f"Writing to: {output_path}")
+        info = send_image_audio(image_path, output_path)
+        print(f"WAV file written: {output_path}")
+        print(f"Image data: {info.get('image_size', 0):,} bytes")
+    
+    if args.play:
+        print("Playing through speaker...")
+        try:
+            # Read image and transmit
+            from .ImageTransport import image_to_ts
+            from .AudioOutput import AcousticDVBT
+            import sounddevice as sd
+            
+            with open(image_path, 'rb') as f:
+                image_data = f.read()
+            
+            # Convert to transport stream
+            ts_data = image_to_ts(image_data)
+            
+            # Create DVB-T audio transmitter
+            tx = AcousticDVBT(audio_sample_rate=args.sample_rate)
+            iq, _ = tx.modulate(ts_data)
+            audio = tx.audio_output._convert_iq_to_stereo_audio(iq)
+            
+            # Play via sounddevice
+            sd.play(audio, args.sample_rate)
+            sd.wait()
+            print("Playback complete.")
+            tx.close()
+        except ImportError:
+            print("Error: sounddevice not installed. Use --output instead.", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+    
+    if not args.output and not args.play:
+        print("No output specified. Use --output FILE.wav or --play")
+        return 1
+    
+    return 0
+
+
+def cmd_receive_image(args: argparse.Namespace) -> int:
+    """Receive image via audio using DVB-T audio mode."""
+    from .ImageTransport import receive_image_audio
+    
+    print("DVB-T Audio Mode Receiver")
+    print(f"  Sample rate: {args.sample_rate} Hz")
+    print(f"  Carrier: {args.carrier} Hz")
+    print(f"  Mode: audio (64-pt FFT, 6kHz BW)")
+    print()
+    
+    if args.input:
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"Error: File not found: {input_path}", file=sys.stderr)
+            return 1
+        print(f"Decoding from: {input_path}")
+        image_data, stats = receive_image_audio(input_path, carrier_freq=args.carrier)
+    else:
+        duration = args.duration
+        print(f"Recording for {duration} seconds...")
+        try:
+            from .AudioInput import AcousticDVBTReceiver
+            from .ImageTransport import ts_to_image
+            
+            # Use AcousticDVBTReceiver which handles channel detection
+            rx = AcousticDVBTReceiver(audio_sample_rate=args.sample_rate, carrier_freq=args.carrier)
+            ts_data, stats = rx.receive(duration)
+            rx.close()
+            
+            # Extract image from TS
+            if len(ts_data) > 0:
+                result = ts_to_image(ts_data)
+                image_data = result[0] if isinstance(result, tuple) else result
+            else:
+                image_data = None
+        except ImportError:
+            print("Error: sounddevice not installed. Use -i FILE.wav instead.", file=sys.stderr)
+            return 1
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+    
+    # Show results
+    print()
+    print("Reception Results:")
+    print(f"  OFDM symbols: {stats.get('symbols', 0):,}")
+    print(f"  RS errors corrected: {stats.get('rs_errors', 0)}")
+    print(f"  RS uncorrectable: {stats.get('rs_uncorrectable', 0)}")
+    print(f"  SNR estimate: {stats.get('snr_db', 0):.1f} dB")
+    print(f"  Packets recovered: {stats.get('packets_recovered', 0)}")
+    
+    # Save if requested
+    if args.output and image_data:
+        output_path = Path(args.output)
+        with open(output_path, 'wb') as f:
+            f.write(image_data)
+        print()
+        print(f"Saved to: {output_path} ({len(image_data):,} bytes)")
+    elif image_data is None:
+        print()
+        print("No image data recovered. Check audio quality and sync.")
+    
+    return 0
+
+
+def cmd_audio_rx_debug(args: argparse.Namespace) -> int:
+    """Receive DVB-T from audio with real-time debug dashboard."""
+    try:
+        from .dashboard import run_debug_dashboard
+    except ImportError as e:
+        print(f"Error: Rich library required for dashboard: {e}", file=sys.stderr)
+        print("Install with: pip install rich", file=sys.stderr)
+        return 1
+    
+    print("Starting DVB-T Audio Debug Dashboard...")
+    print("Press Ctrl+C to stop")
+    print()
+    
+    try:
+        ts_data, stats = run_debug_dashboard(
+            input_file=args.input,
+            duration=args.duration,
+            sample_rate=args.sample_rate,
+            carrier_freq=args.carrier,
+            output_file=args.output,
+            output_image=getattr(args, 'output_image', None),
+            save_audio=getattr(args, 'save_audio', None),
+        )
+        
+        # Print final summary
+        print()
+        print("Final Statistics:")
+        print(f"  Symbols processed: {stats.get('symbols', 0):,}")
+        print(f"  RS errors corrected: {stats.get('rs_errors', 0)}")
+        print(f"  RS uncorrectable: {stats.get('rs_uncorrectable', 0)}")
+        print(f"  Packets recovered: {stats.get('packets_recovered', 0)}")
+        print(f"  Data recovered: {len(ts_data):,} bytes")
+        
+        return 0
+        
+    except KeyboardInterrupt:
+        print("\nStopped by user")
+        return 0
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_image_loopback(args: argparse.Namespace) -> int:
+    """Test image send/receive loopback using DVB-T audio mode."""
+    from .ImageTransport import send_image_audio, receive_image_audio
+    import tempfile
+    
+    image_path = Path(args.file)
+    if not image_path.exists():
+        print(f"Error: File not found: {image_path}", file=sys.stderr)
+        return 1
+    
+    print(f"Image: {image_path}")
+    print(f"Size: {image_path.stat().st_size:,} bytes")
+    print()
+    print("DVB-T Audio Mode Loopback Test")
+    print("  Mode: audio (64-pt FFT, 24 carriers, 6kHz BW)")
+    print("  Modulation: QPSK with full DVB-T FEC chain")
+    
+    # Read original image
+    with open(image_path, 'rb') as f:
+        original_data = f.read()
+    
+    # Create temp WAV file
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+        wav_path = Path(tmp.name)
+    
+    try:
+        # Transmit to WAV
+        print(f"\nTransmitting via DVB-T audio mode...")
+        info = send_image_audio(image_path, wav_path)
+        print(f"WAV file: {wav_path.stat().st_size:,} bytes")
+        
+        # Receive from WAV
+        print("\nReceiving from audio...")
+        recovered_data, stats = receive_image_audio(wav_path)
+        
+        print("\nDVB-T Reception Statistics:")
+        print(f"  OFDM symbols: {stats.get('symbols', 0)}")
+        print(f"  RS errors corrected: {stats.get('rs_errors', 0)}")
+        print(f"  RS uncorrectable: {stats.get('rs_uncorrectable', 0)}")
+        print(f"  SNR estimate: {stats.get('snr_db', 0):.1f} dB")
+        print(f"  Packets recovered: {stats.get('packets_recovered', 0)}")
+        
+        if recovered_data:
+            match = recovered_data == original_data
+            print(f"  Data match: {match}")
+            
+            if match:
+                print("\n  SUCCESS: Image transmitted via DVB-T audio and received correctly!")
+            else:
+                # Show byte match rate
+                match_len = min(len(original_data), len(recovered_data))
+                matches = sum(1 for i in range(match_len)
+                             if original_data[i] == recovered_data[i])
+                print(f"  Byte match: {matches}/{match_len} ({100*matches/match_len:.1f}%)")
+            
+            # Save recovered image
+            if args.output:
+                output_path = Path(args.output)
+                with open(output_path, 'wb') as f:
+                    f.write(recovered_data)
+                print(f"\nSaved recovered image to: {output_path}")
+        else:
+            print("\n  FAILED: Could not recover image data")
+        
+    finally:
+        if wav_path.exists():
+            wav_path.unlink()
+    
+    return 0
+
+
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -304,6 +763,90 @@ def main() -> int:
     gen_parser.add_argument('-n', '--packets', type=int, default=1000,
                            help='Number of packets (default: 1000)')
     
+    # Audio TX command
+    audio_tx_parser = subparsers.add_parser('audio-tx', 
+                                            help='Transmit TS via audio speaker')
+    audio_tx_parser.add_argument('file', help='Transport stream file')
+    audio_tx_parser.add_argument('-o', '--output', help='Output WAV file')
+    audio_tx_parser.add_argument('--play', action='store_true',
+                                help='Play through speaker')
+    audio_tx_parser.add_argument('--sample-rate', type=int, default=48000,
+                                help='Audio sample rate (default: 48000)')
+    audio_tx_parser.add_argument('--carrier', type=float, default=5000,
+                                help='Carrier frequency (default: 5000)')
+    audio_tx_parser.add_argument('--amplitude', type=float, default=0.8,
+                                help='Output amplitude 0-1 (default: 0.8)')
+    
+    # Audio RX command
+    audio_rx_parser = subparsers.add_parser('audio-rx',
+                                            help='Receive DVB-T from microphone')
+    audio_rx_parser.add_argument('-i', '--input', help='Input WAV file (instead of mic)')
+    audio_rx_parser.add_argument('-o', '--output', help='Output TS file')
+    audio_rx_parser.add_argument('-d', '--duration', type=float, default=5.0,
+                                help='Recording duration in seconds (default: 5)')
+    audio_rx_parser.add_argument('--sample-rate', type=int, default=48000,
+                                help='Audio sample rate (default: 48000)')
+    audio_rx_parser.add_argument('--carrier', type=float, default=5000,
+                                help='Carrier frequency (default: 5000)')
+    
+    # Audio loopback test
+    loopback_parser = subparsers.add_parser('audio-loopback',
+                                            help='Test audio TX->WAV->RX loopback')
+    loopback_parser.add_argument('-n', '--packets', type=int, default=100,
+                                help='Number of test packets (default: 100)')
+    loopback_parser.add_argument('--sample-rate', type=int, default=48000,
+                                help='Audio sample rate (default: 48000)')
+    loopback_parser.add_argument('--carrier', type=float, default=5000,
+                                help='Carrier frequency (default: 5000)')
+    
+    # Send image via audio
+    send_img_parser = subparsers.add_parser('send-image',
+                                            help='Send image via audio')
+    send_img_parser.add_argument('file', help='Image file (JPG, PNG, etc.)')
+    send_img_parser.add_argument('-o', '--output', help='Output WAV file')
+    send_img_parser.add_argument('--play', action='store_true',
+                                help='Play through speaker')
+    send_img_parser.add_argument('--sample-rate', type=int, default=48000,
+                                help='Audio sample rate (default: 48000)')
+    send_img_parser.add_argument('--carrier', type=float, default=5000,
+                                help='Carrier frequency (default: 5000)')
+    
+    # Receive image via audio
+    recv_img_parser = subparsers.add_parser('receive-image',
+                                            help='Receive image via audio')
+    recv_img_parser.add_argument('-i', '--input', help='Input WAV file')
+    recv_img_parser.add_argument('-o', '--output', help='Output image file')
+    recv_img_parser.add_argument('-d', '--duration', type=float, default=10.0,
+                                help='Recording duration (default: 10)')
+    recv_img_parser.add_argument('--sample-rate', type=int, default=48000,
+                                help='Audio sample rate (default: 48000)')
+    recv_img_parser.add_argument('--carrier', type=float, default=5000,
+                                help='Carrier frequency (default: 5000 for laptop speakers)')
+    
+    # Image loopback test
+    img_loopback_parser = subparsers.add_parser('image-loopback',
+                                                help='Test image TX->WAV->RX')
+    img_loopback_parser.add_argument('file', help='Image file to test')
+    img_loopback_parser.add_argument('-o', '--output', help='Save recovered image')
+    img_loopback_parser.add_argument('--sample-rate', type=int, default=48000,
+                                    help='Audio sample rate (default: 48000)')
+    img_loopback_parser.add_argument('--carrier', type=float, default=5000,
+                                    help='Carrier frequency (default: 5000 for laptop speakers)')
+    
+    # Audio RX with debug dashboard
+    audio_rx_debug_parser = subparsers.add_parser('audio-rx-debug',
+                                                  help='Receive DVB-T with debug dashboard')
+    audio_rx_debug_parser.add_argument('-i', '--input', help='Input WAV file (instead of mic)')
+    audio_rx_debug_parser.add_argument('-o', '--output', help='Output TS file')
+    audio_rx_debug_parser.add_argument('--output-image', help='Output image file (auto-saves if not specified)')
+    audio_rx_debug_parser.add_argument('--save-audio', help='Save input audio to WAV file')
+    audio_rx_debug_parser.add_argument('-d', '--duration', type=float, default=30.0,
+                                      help='Recording duration in seconds (default: 30)')
+    audio_rx_debug_parser.add_argument('--sample-rate', type=int, default=48000,
+                                      help='Audio sample rate (default: 48000)')
+    audio_rx_debug_parser.add_argument('--carrier', type=float, default=5000,
+                                      help='Carrier frequency (default: 5000)')
+    
     args = parser.parse_args()
     
     if args.command is None:
@@ -315,6 +858,13 @@ def main() -> int:
         'demux': cmd_demux,
         'modulate': cmd_modulate,
         'generate': cmd_generate,
+        'audio-tx': cmd_audio_tx,
+        'audio-rx': cmd_audio_rx,
+        'audio-loopback': cmd_audio_loopback,
+        'audio-rx-debug': cmd_audio_rx_debug,
+        'send-image': cmd_send_image,
+        'receive-image': cmd_receive_image,
+        'image-loopback': cmd_image_loopback,
     }
     
     return commands[args.command](args)

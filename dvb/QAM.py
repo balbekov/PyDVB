@@ -264,23 +264,24 @@ class QAMDemapper:
     
     def _demap_hard(self, symbols: np.ndarray) -> np.ndarray:
         """
-        Hard decision demapping.
+        Hard decision demapping (vectorized).
         
         Finds nearest constellation point for each received symbol.
         """
         num_symbols = len(symbols)
-        bits = np.zeros(num_symbols * self.bits_per_symbol, dtype=np.uint8)
         
-        for i, s in enumerate(symbols):
-            # Find nearest constellation point
-            distances = np.abs(s - self._table)
-            nearest_idx = np.argmin(distances)
-            
-            # Extract bits from index
-            for b in range(self.bits_per_symbol):
-                bits[i * self.bits_per_symbol + b] = (
-                    (nearest_idx >> (self.bits_per_symbol - 1 - b)) & 1
-                )
+        # Compute distances from all symbols to all constellation points
+        # symbols: (N,), table: (M,) -> distances: (N, M)
+        distances = np.abs(symbols[:, np.newaxis] - self._table[np.newaxis, :])
+        
+        # Find nearest constellation point for each symbol
+        nearest_idx = np.argmin(distances, axis=1)
+        
+        # Extract bits from indices (vectorized)
+        bits = np.zeros(num_symbols * self.bits_per_symbol, dtype=np.uint8)
+        for b in range(self.bits_per_symbol):
+            shift = self.bits_per_symbol - 1 - b
+            bits[b::self.bits_per_symbol] = (nearest_idx >> shift) & 1
         
         return bits
     

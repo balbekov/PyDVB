@@ -17,6 +17,90 @@ Reference: ETSI EN 300 744 Section 4.3.4
 import numpy as np
 from typing import Union, Tuple, List
 
+# Try to import Numba for JIT acceleration
+try:
+    from numba import njit, prange
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    # Provide dummy decorator
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        return decorator
+    prange = range
+
+
+@njit(cache=True)
+def _viterbi_forward_pass(rx_pairs, prev_states, expected_output, 
+                          forward_next, num_states, num_symbols):
+    """
+    Numba-accelerated Viterbi forward pass.
+    
+    This is the hot loop that benefits most from JIT compilation.
+    """
+    # Path metrics
+    pm = np.full(num_states, np.float32(1e9), dtype=np.float32)
+    pm[0] = 0.0
+    
+    # Survivor paths
+    survivors = np.zeros((num_symbols, num_states), dtype=np.int32)
+    
+    # Process each received symbol
+    for t in range(num_symbols):
+        rx0 = rx_pairs[t, 0]
+        rx1 = rx_pairs[t, 1]
+        
+        new_pm = np.full(num_states, np.float32(1e9), dtype=np.float32)
+        
+        for state in range(num_states):
+            for path in range(2):
+                prev_state = prev_states[state, path]
+                
+                # Branch metric (Hamming distance)
+                exp0 = expected_output[state, path, 0]
+                exp1 = expected_output[state, path, 1]
+                
+                # Numba-compatible: use int comparison instead of float(bool)
+                bm = np.float32(0.0)
+                if rx0 != exp0:
+                    bm += 1.0
+                if rx1 != exp1:
+                    bm += 1.0
+                
+                # Total path metric
+                total = pm[prev_state] + bm
+                
+                if total < new_pm[state]:
+                    new_pm[state] = total
+                    survivors[t, state] = prev_state
+        
+        pm = new_pm
+    
+    return survivors, pm
+
+
+@njit(cache=True)
+def _viterbi_traceback(survivors, forward_next, final_state, num_symbols):
+    """Numba-accelerated traceback."""
+    decoded = np.zeros(num_symbols, dtype=np.uint8)
+    state = final_state
+    
+    for t in range(num_symbols - 1, -1, -1):
+        prev_state = survivors[t, state]
+        
+        # Find which input bit caused this transition
+        if forward_next[prev_state, 1] == state:
+            decoded[t] = 1
+        else:
+            decoded[t] = 0
+        
+        state = prev_state
+    
+    return decoded
+
 
 class ConvolutionalEncoder:
     """
@@ -271,6 +355,9 @@ class ConvolutionalDecoder:
         """
         Decode using Viterbi algorithm.
         
+        Uses Numba JIT acceleration if available, otherwise falls back
+        to vectorized NumPy implementation.
+        
         Args:
             received: Received bits (hard decision) or soft values
             terminated: Expect terminated trellis (ending at state 0)
@@ -283,63 +370,76 @@ class ConvolutionalDecoder:
         
         num_symbols = len(received) // 2
         
-        # Path metrics (costs to reach each state)
-        pm = np.full(self.num_states, np.inf)
-        pm[0] = 0  # Start at state 0
+        # Reshape received for processing
+        rx_pairs = received.reshape(-1, 2).astype(np.uint8)
         
-        # Survivor paths
-        survivors = np.zeros((num_symbols, self.num_states), dtype=np.int32)
-        
-        # Process each received symbol
-        for t in range(num_symbols):
-            rx = received[2*t:2*t+2]
+        if HAS_NUMBA and not self.soft_decision:
+            # Use Numba-accelerated version
+            survivors, pm = _viterbi_forward_pass(
+                rx_pairs,
+                self._prev_states,
+                self._expected_output,
+                self._forward_next,
+                self.num_states,
+                num_symbols
+            )
             
-            # New path metrics
-            new_pm = np.full(self.num_states, np.inf)
+            # Determine final state
+            if terminated:
+                final_state = 0
+            else:
+                final_state = int(np.argmin(pm))
             
-            for state in range(self.num_states):
-                for i in range(2):  # Two paths into each state
-                    prev_state = self._prev_states[state, i]
-                    expected = self._expected_output[state, i]
-                    
-                    # Branch metric (Hamming distance for hard decision)
-                    if self.soft_decision:
-                        # For soft: use Euclidean-like distance
-                        bm = np.sum(np.abs(rx - expected))
-                    else:
-                        bm = np.sum(rx != expected)
-                    
-                    # Total path metric
-                    total = pm[prev_state] + bm
-                    
-                    if total < new_pm[state]:
-                        new_pm[state] = total
-                        survivors[t, state] = prev_state
-            
-            pm = new_pm
-        
-        # Traceback
-        if terminated:
-            state = 0  # Must end at state 0
+            # Traceback
+            decoded = _viterbi_traceback(
+                survivors, 
+                self._forward_next,
+                final_state,
+                num_symbols
+            )
         else:
-            state = np.argmin(pm)  # Best final state
-        
-        decoded = np.zeros(num_symbols, dtype=np.uint8)
-        
-        for t in range(num_symbols - 1, -1, -1):
-            prev_state = survivors[t, state]
-            
-            # Find which input bit caused this transition
-            for inp in range(2):
-                if self._forward_next[prev_state, inp] == state:
-                    decoded[t] = inp
-                    break
-            
-            state = prev_state
+            # Fallback to vectorized NumPy (for soft decision or no Numba)
+            decoded = self._decode_numpy(rx_pairs, num_symbols, terminated)
         
         # Remove tail bits if terminated
         if terminated:
             decoded = decoded[:-(self.K - 1)]
+        
+        return decoded
+    
+    def _decode_numpy(self, rx_pairs: np.ndarray, num_symbols: int, 
+                      terminated: bool) -> np.ndarray:
+        """Vectorized NumPy fallback for Viterbi decoding."""
+        # Path metrics
+        pm = np.full(self.num_states, np.inf, dtype=np.float32)
+        pm[0] = 0
+        
+        survivors = np.zeros((num_symbols, self.num_states), dtype=np.int32)
+        all_expected = self._expected_output
+        
+        for t in range(num_symbols):
+            rx = rx_pairs[t]
+            
+            if self.soft_decision:
+                bm = np.sum(np.abs(all_expected - rx), axis=2)
+            else:
+                bm = np.sum(all_expected != rx, axis=2)
+            
+            prev_pm = pm[self._prev_states]
+            total_pm = prev_pm + bm
+            
+            min_idx = np.argmin(total_pm, axis=1)
+            pm = total_pm[np.arange(self.num_states), min_idx]
+            survivors[t] = self._prev_states[np.arange(self.num_states), min_idx]
+        
+        # Traceback
+        state = 0 if terminated else int(np.argmin(pm))
+        decoded = np.zeros(num_symbols, dtype=np.uint8)
+        
+        for t in range(num_symbols - 1, -1, -1):
+            prev_state = survivors[t, state]
+            decoded[t] = 1 if self._forward_next[prev_state, 1] == state else 0
+            state = prev_state
         
         return decoded
     

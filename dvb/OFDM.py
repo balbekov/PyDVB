@@ -26,12 +26,16 @@ class OFDMModulator:
     using IFFT.
     
     Attributes:
-        mode: '2K' or '8K'
-        fft_size: FFT size (2048 or 8192)
-        active_carriers: Number of active carriers (1705 or 6817)
+        mode: '2K', '8K', or 'audio'
+        fft_size: FFT size (2048, 8192, or 128 for audio)
+        active_carriers: Number of active carriers
         
     Example:
         >>> mod = OFDMModulator('2K')
+        >>> time_samples = mod.modulate(carrier_values)
+        
+        >>> # Audio mode for acoustic transmission
+        >>> mod = OFDMModulator('audio')
         >>> time_samples = mod.modulate(carrier_values)
     """
     
@@ -44,6 +48,16 @@ class OFDMModulator:
         '8K': {
             'fft_size': 8192,
             'active_carriers': 6817,
+        },
+        'audio': {
+            # Narrowband mode for speaker->mic acoustic transmission
+            # 16 kHz OFDM sample rate (upsampled to 48kHz for audio output)
+            # 64-point FFT = 250 Hz carrier spacing
+            # 24 active carriers = 6 kHz bandwidth
+            # Fits in 10-16 kHz band when modulated onto 13 kHz carrier
+            'fft_size': 64,
+            'active_carriers': 24,
+            'ofdm_sample_rate': 16000,  # Native OFDM sample rate
         },
     }
     
@@ -238,8 +252,8 @@ def get_carrier_frequencies(mode: str, bandwidth: str = '8MHz') -> np.ndarray:
     Get carrier frequencies relative to center frequency.
     
     Args:
-        mode: '2K' or '8K'
-        bandwidth: '6MHz', '7MHz', or '8MHz'
+        mode: '2K', '8K', or 'audio'
+        bandwidth: '6MHz', '7MHz', '8MHz', or 'audio'
         
     Returns:
         Array of carrier frequency offsets in Hz
@@ -248,8 +262,10 @@ def get_carrier_frequencies(mode: str, bandwidth: str = '8MHz') -> np.ndarray:
     if not params:
         raise ValueError(f"Invalid mode: {mode}")
     
-    # Carrier spacing
-    if bandwidth == '8MHz':
+    # Carrier spacing = sample_rate / fft_size
+    if mode == 'audio' or bandwidth == 'audio':
+        carrier_spacing = 48000.0 / params['fft_size']  # 375 Hz for 128-pt FFT
+    elif bandwidth == '8MHz':
         carrier_spacing = 4464.2857  # Hz for 8MHz bandwidth
     elif bandwidth == '7MHz':
         carrier_spacing = 3906.25
@@ -268,7 +284,7 @@ def calculate_symbol_duration(mode: str, guard_interval: str,
     Calculate OFDM symbol timing.
     
     Args:
-        mode: '2K' or '8K'
+        mode: '2K', '8K', or 'audio'
         guard_interval: '1/4', '1/8', '1/16', '1/32'
         bandwidth: Channel bandwidth
         
@@ -284,16 +300,25 @@ def calculate_symbol_duration(mode: str, guard_interval: str,
         '8MHz': 9142857.142857143,
         '7MHz': 8000000.0,
         '6MHz': 6857142.857142857,
+        'audio': 48000.0,
     }
-    sample_rate = sample_rates.get(bandwidth, sample_rates['8MHz'])
+    
+    if mode == 'audio':
+        sample_rate = 48000.0
+    else:
+        sample_rate = sample_rates.get(bandwidth, sample_rates['8MHz'])
     
     # Useful symbol duration
     fft_size = params['fft_size']
     useful_duration = fft_size / sample_rate
     
     # Guard interval duration
-    guard_ratios = {'1/4': 4, '1/8': 8, '1/16': 16, '1/32': 32}
+    guard_ratios = {'1/4': 4, '1/8': 8, '1/16': 16, '1/32': 32, 'acoustic': 0.4}
     guard_ratio = guard_ratios.get(guard_interval, 4)
-    guard_duration = useful_duration / guard_ratio
+    if guard_ratio < 1:
+        # Acoustic mode: guard > useful (guard = useful / 0.4 = 2.5 * useful)
+        guard_duration = useful_duration / guard_ratio
+    else:
+        guard_duration = useful_duration / guard_ratio
     
     return useful_duration, guard_duration

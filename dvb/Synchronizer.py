@@ -36,7 +36,7 @@ class CoarseSync:
     boundaries, and the phase of correlation gives coarse CFO estimate.
     
     Attributes:
-        fft_size: FFT size (2048 or 8192)
+        fft_size: FFT size (2048, 8192, or 128 for audio)
         guard_length: Guard interval length in samples
         
     Example:
@@ -50,7 +50,7 @@ class CoarseSync:
         Initialize coarse synchronizer.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
             guard_interval: '1/4', '1/8', '1/16', '1/32'
             sample_rate: Sample rate in Hz
         """
@@ -59,11 +59,16 @@ class CoarseSync:
         self.sample_rate = sample_rate
         
         # FFT parameters
-        self.fft_size = {'2K': 2048, '8K': 8192}[mode]
+        self.fft_size = {'2K': 2048, '8K': 8192, 'audio': 64}[mode]
         
         # Guard interval length
-        gi_fractions = {'1/4': 4, '1/8': 8, '1/16': 16, '1/32': 32}
-        self.guard_length = self.fft_size // gi_fractions[guard_interval]
+        gi_fractions = {'1/4': 4, '1/8': 8, '1/16': 16, '1/32': 32, 'acoustic': 0.4}
+        divisor = gi_fractions[guard_interval]
+        if divisor < 1:
+            # Fractional divisor for acoustic mode (guard > fft_size)
+            self.guard_length = int(self.fft_size / divisor)
+        else:
+            self.guard_length = self.fft_size // int(divisor)
         
         # Total symbol length
         self.symbol_length = self.fft_size + self.guard_length
@@ -194,8 +199,10 @@ class CoarseSync:
         # Phase gives CFO
         phase = np.angle(correlation)
         
-        # CFO = phase / (2 * pi * Tu) where Tu = FFT_size / sample_rate
-        cfo = phase * self.sample_rate / (2 * np.pi * self.fft_size)
+        # CFO = -phase / (2 * pi * Tu) where Tu = FFT_size / sample_rate
+        # The negative sign is because correlation of s1*conj(s2) where s2 
+        # is delayed by FFT_size samples gives phase = -2*pi*cfo*FFT_size/fs
+        cfo = -phase * self.sample_rate / (2 * np.pi * self.fft_size)
         
         return float(cfo)
     
@@ -264,7 +271,7 @@ class FineSync:
     - Integer CFO estimation (subcarrier shift)
     
     Attributes:
-        mode: '2K' or '8K'
+        mode: '2K', '8K', or 'audio'
         
     Example:
         >>> sync = FineSync('2K')
@@ -277,14 +284,14 @@ class FineSync:
         Initialize fine synchronizer.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
             sample_rate: Sample rate in Hz
         """
         self.mode = mode
         self.sample_rate = sample_rate
-        self.fft_size = {'2K': 2048, '8K': 8192}[mode]
+        self.fft_size = {'2K': 2048, '8K': 8192, 'audio': 64}[mode]
         self.carrier_spacing = sample_rate / self.fft_size
-        self.active_carriers = {'2K': 1705, '8K': 6817}[mode]
+        self.active_carriers = {'2K': 1705, '8K': 6817, 'audio': 24}[mode]
         
         # Generate expected pilot values
         self._generate_pilots()
@@ -473,7 +480,7 @@ class FrameSync:
     synchronization words that identify frame boundaries.
     
     Attributes:
-        mode: '2K' or '8K'
+        mode: '2K', '8K', or 'audio'
         
     Example:
         >>> sync = FrameSync('2K')
@@ -484,38 +491,47 @@ class FrameSync:
     SYNC_EVEN = np.array([0,0,1,1,0,1,0,1,1,1,1,0,1,1,1,0], dtype=np.uint8)
     SYNC_ODD = np.array([1,1,0,0,1,0,1,0,0,0,0,1,0,0,0,1], dtype=np.uint8)
     
+    # Audio mode sync words (shorter)
+    SYNC_AUDIO_EVEN = np.array([0,1,0,1], dtype=np.uint8)
+    SYNC_AUDIO_ODD = np.array([1,0,1,0], dtype=np.uint8)
+    
     def __init__(self, mode: str = '2K'):
         """
         Initialize frame synchronizer.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
         """
         self.mode = mode
         self._frame_number = 0
         self._symbol_in_frame = 0
         self._synced = False
+        self.symbols_per_frame = 16 if mode == 'audio' else 68
     
     def detect_sync_word(self, tps_bits: np.ndarray) -> Tuple[bool, bool]:
         """
         Detect TPS sync word in received bits.
         
         Args:
-            tps_bits: TPS bits from symbol 1 (16 bits)
+            tps_bits: TPS bits from symbol 1 (16 bits for 2K/8K, 4 for audio)
             
         Returns:
             Tuple of (is_sync_detected, is_even_frame)
         """
-        if len(tps_bits) < 16:
-            return False, False
-        
-        sync_bits = tps_bits[:16]
-        
-        # Check correlation with sync words
-        even_corr = np.sum(sync_bits == self.SYNC_EVEN)
-        odd_corr = np.sum(sync_bits == self.SYNC_ODD)
-        
-        threshold = 12  # Allow some bit errors
+        if self.mode == 'audio':
+            if len(tps_bits) < 4:
+                return False, False
+            sync_bits = tps_bits[:4]
+            even_corr = np.sum(sync_bits == self.SYNC_AUDIO_EVEN)
+            odd_corr = np.sum(sync_bits == self.SYNC_AUDIO_ODD)
+            threshold = 3  # Allow 1 bit error for audio
+        else:
+            if len(tps_bits) < 16:
+                return False, False
+            sync_bits = tps_bits[:16]
+            even_corr = np.sum(sync_bits == self.SYNC_EVEN)
+            odd_corr = np.sum(sync_bits == self.SYNC_ODD)
+            threshold = 12  # Allow some bit errors
         
         if even_corr >= threshold:
             return True, True
@@ -529,11 +545,11 @@ class FrameSync:
         Update frame sync state.
         
         Args:
-            symbol_index: Current symbol in frame (0-67)
+            symbol_index: Current symbol in frame (0-67 for 2K/8K, 0-15 for audio)
         """
         self._symbol_in_frame = symbol_index
         
-        if symbol_index == 67:
+        if symbol_index == self.symbols_per_frame - 1:
             self._frame_number = (self._frame_number + 1) % 4
     
     def get_frame_position(self) -> Tuple[int, int]:
@@ -561,11 +577,11 @@ class FrameSync:
         Returns:
             True if sync acquired
         """
-        if len(tps_sequence) < 68:
+        if len(tps_sequence) < self.symbols_per_frame:
             return False
         
         # Look for sync word at symbol 1
-        for i in range(len(tps_sequence) - 67):
+        for i in range(len(tps_sequence) - (self.symbols_per_frame - 1)):
             is_sync, is_even = self.detect_sync_word(tps_sequence[i + 1])
             
             if is_sync:
@@ -587,6 +603,10 @@ class DVBTSynchronizer:
         >>> sync = DVBTSynchronizer(mode='2K', guard_interval='1/4')
         >>> result = sync.synchronize(samples)
         >>> aligned = samples[result.symbol_start:]
+        
+        >>> # Audio mode
+        >>> sync = DVBTSynchronizer(mode='audio', guard_interval='1/4', sample_rate=48000)
+        >>> result = sync.synchronize(samples)
     """
     
     def __init__(self, mode: str = '2K', guard_interval: str = '1/4',
@@ -595,7 +615,7 @@ class DVBTSynchronizer:
         Initialize complete synchronizer.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
             guard_interval: Guard interval ratio
             sample_rate: Sample rate in Hz
         """

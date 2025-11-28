@@ -49,15 +49,15 @@ class ChannelEstimator:
         Initialize channel estimator.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
             interpolation: Interpolation method ('linear', 'cubic', 'dft')
         """
         self.mode = mode
         self.interpolation = interpolation
         
         # Mode parameters
-        self.fft_size = {'2K': 2048, '8K': 8192}[mode]
-        self.active_carriers = {'2K': 1705, '8K': 6817}[mode]
+        self.fft_size = {'2K': 2048, '8K': 8192, 'audio': 64}[mode]
+        self.active_carriers = {'2K': 1705, '8K': 6817, 'audio': 24}[mode]
         
         # Initialize pilot information
         self._init_pilots()

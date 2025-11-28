@@ -58,7 +58,7 @@ class DVBTDetector:
     }
     
     # Guard interval fractions
-    GI_FRACTIONS = {'1/4': 4, '1/8': 8, '1/16': 16, '1/32': 32}
+    GI_FRACTIONS = {'1/4': 4, '1/8': 8, '1/16': 16, '1/32': 32, 'acoustic': 0.4}
     
     def __init__(self, sample_rate: float = 9142857.142857143):
         """

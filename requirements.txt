@@ -4,6 +4,9 @@
 numpy>=1.24.0
 scipy>=1.10.0
 
+# Optional: JIT acceleration (10-30x speedup for Viterbi/RS decoding)
+numba>=0.58.0
+
 # Testing
 pytest>=7.0.0
 pytest-cov>=4.0.0
@@ -15,3 +18,11 @@ matplotlib>=3.7.0
 flask>=3.0.0
 plotly>=5.18.0
 pillow>=10.0.0
+
+# Audio I/O (optional - for acoustic transmission)
+# Install one of these for audio support:
+sounddevice>=0.4.6  # Recommended: cross-platform, simple API
+# pyaudio>=0.2.13   # Alternative: may need portaudio system library
+
+# Terminal dashboard
+rich>=13.0.0

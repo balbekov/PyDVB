@@ -32,17 +32,22 @@ class FrameBuilder:
     Combines data, pilots, and TPS into complete OFDM frames.
     
     Attributes:
-        mode: '2K' or '8K'
+        mode: '2K', '8K', or 'audio'
         guard_interval: Guard interval ratio
         constellation: Modulation type
-        symbols_per_frame: Number of symbols per frame (68)
+        symbols_per_frame: Number of symbols per frame (68 for 2K/8K, 16 for audio)
         
     Example:
         >>> builder = FrameBuilder('2K', '1/4', '64QAM')
         >>> frame_samples = builder.build_frame(data_symbols)
+        
+        >>> # Audio mode
+        >>> builder = FrameBuilder('audio', '1/4', 'QPSK')
+        >>> frame_samples = builder.build_frame(data_symbols)
     """
     
     SYMBOLS_PER_FRAME = 68
+    SYMBOLS_PER_FRAME_AUDIO = 16  # Shorter frames for audio
     FRAMES_PER_SUPERFRAME = 4
     
     def __init__(self, mode: str = '2K', guard_interval: str = '1/4',
@@ -51,7 +56,7 @@ class FrameBuilder:
         Initialize frame builder.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
             guard_interval: '1/4', '1/8', '1/16', '1/32'
             constellation: 'QPSK', '16QAM', '64QAM'
             code_rate: '1/2', '2/3', '3/4', '5/6', '7/8'
@@ -60,6 +65,12 @@ class FrameBuilder:
         self.guard_interval = guard_interval
         self.constellation = constellation
         self.code_rate = code_rate
+        
+        # Set symbols per frame based on mode
+        self.symbols_per_frame = (
+            self.SYMBOLS_PER_FRAME_AUDIO if mode == 'audio' 
+            else self.SYMBOLS_PER_FRAME
+        )
         
         # Initialize components
         self.ofdm_mod = OFDMModulator(mode)
@@ -81,16 +92,18 @@ class FrameBuilder:
     
     def _calc_capacity(self) -> None:
         """Calculate data carrier capacity per symbol and frame."""
-        # Get data carrier counts for each symbol pattern (repeats every 4)
+        # Get data carrier counts for each symbol pattern
+        # Pattern repeats: 4 symbols for 2K/8K, 1 for audio (fixed pattern)
+        pattern_len = 1 if self.mode == 'audio' else 4
         self.data_carriers_per_symbol = [
             self.pilot_inserter.get_data_carrier_count(i) 
-            for i in range(4)
+            for i in range(pattern_len)
         ]
         
         # Total data carriers per frame
         self.data_carriers_per_frame = 0
-        for sym in range(self.SYMBOLS_PER_FRAME):
-            self.data_carriers_per_frame += self.data_carriers_per_symbol[sym % 4]
+        for sym in range(self.symbols_per_frame):
+            self.data_carriers_per_frame += self.data_carriers_per_symbol[sym % pattern_len]
     
     def get_data_carriers_per_frame(self) -> int:
         """Get total number of data carriers per frame."""
@@ -142,10 +155,11 @@ class FrameBuilder:
         # Build each symbol
         symbols = []
         data_idx = 0
+        pattern_len = 1 if self.mode == 'audio' else 4
         
-        for sym_idx in range(self.SYMBOLS_PER_FRAME):
+        for sym_idx in range(self.symbols_per_frame):
             # Get data carriers needed for this symbol
-            num_data = self.data_carriers_per_symbol[sym_idx % 4]
+            num_data = self.data_carriers_per_symbol[sym_idx % pattern_len]
             
             if data_idx + num_data <= len(data):
                 sym_data = data[data_idx:data_idx + num_data]
@@ -167,23 +181,28 @@ class FrameBuilder:
     
     def build_superframe(self, data: np.ndarray) -> np.ndarray:
         """
-        Build complete superframe (4 frames).
+        Build complete transmission (as many frames as needed).
         
         Args:
-            data: QAM-modulated data for entire superframe
+            data: QAM-modulated data for transmission
             
         Returns:
-            Time-domain samples for superframe
+            Time-domain samples for all frames
         """
         frames = []
         data_per_frame = self.data_carriers_per_frame
         
-        for frame_num in range(self.FRAMES_PER_SUPERFRAME):
+        # Calculate number of frames needed
+        num_frames = (len(data) + data_per_frame - 1) // data_per_frame
+        num_frames = max(num_frames, self.FRAMES_PER_SUPERFRAME)  # At least one superframe
+        
+        for frame_num in range(num_frames):
             start = frame_num * data_per_frame
             end = start + data_per_frame
             
             frame_data = data[start:end] if start < len(data) else np.array([])
-            frames.append(self.build_frame(frame_data, frame_num))
+            # Frame number cycles 0-3 within each superframe
+            frames.append(self.build_frame(frame_data, frame_num % self.FRAMES_PER_SUPERFRAME))
         
         return np.concatenate(frames)
     
@@ -203,13 +222,14 @@ class FrameBuilder:
         """
         data_idx = 0
         frame_num = start_frame
+        pattern_len = 1 if self.mode == 'audio' else 4
         
         while data_idx < len(data):
             # Generate TPS for current frame
             frame_tps = self.tps_encoder.encode_frame(frame_num % 4)
             
-            for sym_idx in range(self.SYMBOLS_PER_FRAME):
-                num_data = self.data_carriers_per_symbol[sym_idx % 4]
+            for sym_idx in range(self.symbols_per_frame):
+                num_data = self.data_carriers_per_symbol[sym_idx % pattern_len]
                 
                 if data_idx >= len(data):
                     break
@@ -240,7 +260,7 @@ class FrameInfo:
         Get frame duration in seconds.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
             guard_interval: Guard interval ratio
             bandwidth: Channel bandwidth
             
@@ -251,19 +271,31 @@ class FrameInfo:
             '8MHz': 9142857.142857143,
             '7MHz': 8000000.0,
             '6MHz': 6857142.857142857,
+            'audio': 48000.0,
         }
-        sample_rate = sample_rates.get(bandwidth, sample_rates['8MHz'])
         
-        fft_sizes = {'2K': 2048, '8K': 8192}
-        guard_fractions = {'1/4': 4, '1/8': 8, '1/16': 16, '1/32': 32}
+        if mode == 'audio':
+            sample_rate = 48000.0
+        else:
+            sample_rate = sample_rates.get(bandwidth, sample_rates['8MHz'])
+        
+        fft_sizes = {'2K': 2048, '8K': 8192, 'audio': 64}
+        guard_fractions = {'1/4': 4, '1/8': 8, '1/16': 16, '1/32': 32, 'acoustic': 0.4}
+        symbols_per_frame = {'2K': 68, '8K': 68, 'audio': 16}
         
         fft_size = fft_sizes.get(mode, 2048)
         guard_frac = guard_fractions.get(guard_interval, 4)
+        num_symbols = symbols_per_frame.get(mode, 68)
         
-        symbol_samples = fft_size + fft_size // guard_frac
+        # Handle acoustic mode with fractional guard ratio
+        if guard_frac < 1:
+            guard_length = int(fft_size / guard_frac)
+        else:
+            guard_length = fft_size // int(guard_frac)
+        symbol_samples = fft_size + guard_length
         symbol_duration = symbol_samples / sample_rate
         
-        return symbol_duration * 68  # 68 symbols per frame
+        return symbol_duration * num_symbols
     
     @staticmethod
     def get_data_rate(mode: str, guard_interval: str, 
@@ -273,7 +305,7 @@ class FrameInfo:
         Get net data rate in bits per second.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
             guard_interval: Guard interval ratio
             constellation: Modulation type
             code_rate: FEC code rate
@@ -297,8 +329,8 @@ class FrameInfo:
         # Bits per frame
         bits_per_frame = carriers_per_frame * bits_per_symbol * rate
         
-        # Frame duration
-        frame_duration = FrameInfo.get_frame_duration(mode, guard_interval, 
-                                                       bandwidth)
+        # Frame duration (use 'audio' bandwidth for audio mode)
+        bw = 'audio' if mode == 'audio' else bandwidth
+        frame_duration = FrameInfo.get_frame_duration(mode, guard_interval, bw)
         
         return bits_per_frame / frame_duration

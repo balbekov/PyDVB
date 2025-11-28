@@ -18,12 +18,14 @@ import numpy as np
 from typing import Tuple
 
 
-# Guard interval fractions
+# Guard interval fractions (divisor: guard = fft_size / divisor)
+# For 'acoustic', we use a special value that means guard = 2.5 * fft_size
 GUARD_FRACTIONS = {
     '1/4': 4,
     '1/8': 8,
     '1/16': 16,
     '1/32': 32,
+    'acoustic': 0.4,  # Special: guard = fft_size / 0.2 = 5 * fft_size (~20ms at 16kHz with 64-pt FFT)
 }
 
 
@@ -50,7 +52,7 @@ class GuardIntervalInserter:
         Initialize guard interval inserter.
         
         Args:
-            ratio: Guard interval ratio ('1/4', '1/8', '1/16', '1/32')
+            ratio: Guard interval ratio ('1/4', '1/8', '1/16', '1/32', 'acoustic')
             fft_size: FFT size (useful symbol length)
         """
         if ratio not in GUARD_FRACTIONS:
@@ -58,7 +60,15 @@ class GuardIntervalInserter:
         
         self.ratio = ratio
         self.fft_size = fft_size
-        self.guard_length = fft_size // GUARD_FRACTIONS[ratio]
+        
+        # Calculate guard length - handle fractional divisors for acoustic mode
+        divisor = GUARD_FRACTIONS[ratio]
+        if divisor < 1:
+            # Fractional divisor means guard > fft_size (e.g., 0.4 -> guard = 2.5 * fft)
+            self.guard_length = int(fft_size / divisor)
+        else:
+            self.guard_length = fft_size // int(divisor)
+        
         self.symbol_length = fft_size + self.guard_length
     
     def add(self, symbol: np.ndarray) -> np.ndarray:
@@ -66,6 +76,8 @@ class GuardIntervalInserter:
         Add guard interval (cyclic prefix) to OFDM symbol.
         
         Copies the last guard_length samples to the beginning.
+        For acoustic mode where guard > fft_size, uses cyclic extension
+        (tiles the symbol to create longer guard).
         
         Args:
             symbol: Time-domain OFDM symbol (length = fft_size)
@@ -78,7 +90,16 @@ class GuardIntervalInserter:
                            f"got {len(symbol)}")
         
         # Cyclic prefix: copy end to beginning
-        guard = symbol[-self.guard_length:]
+        # For acoustic mode, guard may be longer than fft_size
+        if self.guard_length <= self.fft_size:
+            guard = symbol[-self.guard_length:]
+        else:
+            # Cyclic extension: tile the symbol to fill guard
+            # E.g., for 160-sample guard with 64-sample symbol:
+            # guard = [symbol, symbol, symbol][-160:] = last 160 samples of tiled symbol
+            tiles_needed = (self.guard_length + self.fft_size - 1) // self.fft_size + 1
+            tiled = np.tile(symbol, tiles_needed)
+            guard = tiled[-self.guard_length:]
         return np.concatenate([guard, symbol])
     
     def add_multiple(self, symbols: np.ndarray) -> np.ndarray:
@@ -121,7 +142,7 @@ class GuardIntervalRemover:
         Initialize guard interval remover.
         
         Args:
-            ratio: Guard interval ratio
+            ratio: Guard interval ratio ('1/4', '1/8', '1/16', '1/32', 'acoustic')
             fft_size: FFT size (useful symbol length)
         """
         if ratio not in GUARD_FRACTIONS:
@@ -129,7 +150,14 @@ class GuardIntervalRemover:
         
         self.ratio = ratio
         self.fft_size = fft_size
-        self.guard_length = fft_size // GUARD_FRACTIONS[ratio]
+        
+        # Calculate guard length - handle fractional divisors for acoustic mode
+        divisor = GUARD_FRACTIONS[ratio]
+        if divisor < 1:
+            self.guard_length = int(fft_size / divisor)
+        else:
+            self.guard_length = fft_size // int(divisor)
+        
         self.symbol_length = fft_size + self.guard_length
     
     def remove(self, symbol: np.ndarray) -> np.ndarray:

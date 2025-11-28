@@ -46,10 +46,10 @@ class PilotGenerator:
         Initialize pilot generator.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
         """
         self.mode = mode
-        self.max_carrier = {'2K': 1705, '8K': 6817}[mode]
+        self.max_carrier = {'2K': 1705, '8K': 6817, 'audio': 24}[mode]
         
         # Generate PRBS sequence for all carriers
         self._prbs = self._generate_prbs()
@@ -148,15 +148,24 @@ class ContinualPilots:
         6381, 6435, 6489, 6603, 6795, 6816
     ], dtype=np.int32)
     
+    # Continual pilot positions for audio mode (3 pilots for 24 carriers)
+    # Positions at edges and middle for channel estimation
+    POSITIONS_AUDIO = np.array([0, 12, 23], dtype=np.int32)
+    
     def __init__(self, mode: str = '2K'):
         """
         Initialize continual pilots.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
         """
         self.mode = mode
-        self.positions = self.POSITIONS_2K if mode == '2K' else self.POSITIONS_8K
+        if mode == '2K':
+            self.positions = self.POSITIONS_2K
+        elif mode == '8K':
+            self.positions = self.POSITIONS_8K
+        else:  # audio
+            self.positions = self.POSITIONS_AUDIO
         self._position_set = set(self.positions)
     
     def is_continual_pilot(self, carrier: int) -> bool:
@@ -175,6 +184,8 @@ class ScatteredPilots:
     Scattered pilots rotate their positions every symbol:
     - Symbol l: positions 3*(l mod 4) + 12*k for k = 0, 1, 2, ...
     - They cover all carriers over 4 consecutive symbols
+    
+    For audio mode: uses every 8th carrier with rotation every 2 symbols.
     """
     
     def __init__(self, mode: str = '2K'):
@@ -182,33 +193,41 @@ class ScatteredPilots:
         Initialize scattered pilots.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
         """
         self.mode = mode
-        self.max_carrier = {'2K': 1705, '8K': 6817}[mode]
+        self.max_carrier = {'2K': 1705, '8K': 6817, 'audio': 24}[mode]
     
     def get_positions(self, symbol_index: int) -> np.ndarray:
         """
         Get scattered pilot positions for a symbol.
         
         Args:
-            symbol_index: Symbol number within frame (0-67)
+            symbol_index: Symbol number within frame
             
         Returns:
             Array of carrier indices
         """
-        # Starting offset depends on symbol number mod 4
-        offset = 3 * (symbol_index % 4)
-        
-        # Positions: offset + 12*k for valid k
-        positions = np.arange(offset, self.max_carrier, 12, dtype=np.int32)
+        if self.mode == 'audio':
+            # Audio mode: fixed pattern (no rotation) for consistent data carrier count
+            # Every 8th carrier starting at position 4 (gives 3 scattered pilots for 24 carriers)
+            positions = np.arange(4, self.max_carrier, 8, dtype=np.int32)
+        else:
+            # Starting offset depends on symbol number mod 4
+            offset = 3 * (symbol_index % 4)
+            # Positions: offset + 12*k for valid k
+            positions = np.arange(offset, self.max_carrier, 12, dtype=np.int32)
         
         return positions
     
     def is_scattered_pilot(self, carrier: int, symbol_index: int) -> bool:
         """Check if carrier is a scattered pilot in this symbol."""
-        offset = 3 * (symbol_index % 4)
-        return (carrier - offset) % 12 == 0 and carrier < self.max_carrier
+        if self.mode == 'audio':
+            # Audio mode: fixed pattern - every 8th carrier starting at 4
+            return (carrier - 4) % 8 == 0 and carrier < self.max_carrier
+        else:
+            offset = 3 * (symbol_index % 4)
+            return (carrier - offset) % 12 == 0 and carrier < self.max_carrier
 
 
 class TPSPilots:
@@ -216,7 +235,7 @@ class TPSPilots:
     DVB-T TPS (Transmission Parameter Signaling) pilot positions.
     
     TPS pilots carry signaling information about transmission parameters.
-    17 carriers in 2K mode, 68 in 8K mode.
+    17 carriers in 2K mode, 68 in 8K mode, 4 in audio mode.
     """
     
     # TPS carrier positions for 2K mode
@@ -236,15 +255,23 @@ class TPSPilots:
         6331, 6374, 6398, 6581, 6706, 6799
     ], dtype=np.int32)
     
+    # TPS carrier positions for audio mode (1 TPS pilot for 24 carriers)
+    POSITIONS_AUDIO = np.array([6], dtype=np.int32)
+    
     def __init__(self, mode: str = '2K'):
         """
         Initialize TPS pilots.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
         """
         self.mode = mode
-        self.positions = self.POSITIONS_2K if mode == '2K' else self.POSITIONS_8K
+        if mode == '2K':
+            self.positions = self.POSITIONS_2K
+        elif mode == '8K':
+            self.positions = self.POSITIONS_8K
+        else:  # audio
+            self.positions = self.POSITIONS_AUDIO
         self._position_set = set(self.positions)
     
     def is_tps_pilot(self, carrier: int) -> bool:
@@ -273,11 +300,11 @@ class PilotInserter:
         Initialize pilot inserter.
         
         Args:
-            mode: '2K' or '8K'
+            mode: '2K', '8K', or 'audio'
         """
         self.mode = mode
-        self.fft_size = {'2K': 2048, '8K': 8192}[mode]
-        self.active_carriers = {'2K': 1705, '8K': 6817}[mode]
+        self.fft_size = {'2K': 2048, '8K': 8192, 'audio': 64}[mode]
+        self.active_carriers = {'2K': 1705, '8K': 6817, 'audio': 24}[mode]
         
         # Initialize pilot components
         self.pilot_gen = PilotGenerator(mode)
@@ -293,7 +320,10 @@ class PilotInserter:
         # Varies by symbol due to scattered pilot rotation
         self.data_carriers_per_symbol = []
         
-        for sym in range(4):  # Pattern repeats every 4 symbols
+        # Pattern repeats: 4 symbols for 2K/8K, 1 for audio (fixed pattern)
+        repeat = 1 if self.mode == 'audio' else 4
+        
+        for sym in range(repeat):
             pilot_count = 0
             
             # Count all pilots
@@ -309,7 +339,8 @@ class PilotInserter:
     
     def get_data_carrier_count(self, symbol_index: int) -> int:
         """Get number of data carriers for a symbol."""
-        return self.data_carriers_per_symbol[symbol_index % 4]
+        repeat = 1 if self.mode == 'audio' else 4
+        return self.data_carriers_per_symbol[symbol_index % repeat]
     
     def insert(self, data: np.ndarray, tps_bits: np.ndarray,
                symbol_index: int) -> np.ndarray:

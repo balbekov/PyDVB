@@ -50,6 +50,13 @@ MODES = {
         'symbols_per_frame': 68,
         'frames_per_superframe': 4,
     },
+    'audio': {
+        'fft_size': 128,
+        'active_carriers': 96,
+        'symbols_per_frame': 16,
+        'frames_per_superframe': 4,
+        'sample_rate': 48000,
+    },
 }
 
 # Guard interval options (fraction of useful symbol duration)
@@ -122,6 +129,17 @@ from .ChannelEstimator import (
 )
 from .Detector import DVBTDetector, DVBTParameters, detect_dvbt_parameters
 
+# Audio I/O for acoustic transmission
+from .AudioOutput import AudioOutput, AcousticDVBT, iq_to_wav
+from .AudioInput import AudioInput, AcousticDVBTReceiver, wav_to_iq
+
+# Image transport
+from .ImageTransport import (
+    ImagePacketizer, ImageDepacketizer,
+    image_to_ts, ts_to_image,
+    send_image_audio, receive_image_audio
+)
+
 __all__ = [
     # Constants
     'MODES', 'GUARD_INTERVALS', 'CONSTELLATIONS', 'CODE_RATES', 'BANDWIDTHS',
@@ -145,6 +163,15 @@ __all__ = [
     'ChannelEstimator', 'Equalizer', 'ChannelEstimatorWithEqualization',
     'EqualizationMethod', 'estimate_snr_from_pilots',
     'DVBTDetector', 'DVBTParameters', 'detect_dvbt_parameters',
+    
+    # Audio I/O (Acoustic Channel)
+    'AudioOutput', 'AudioInput', 'AcousticDVBT', 'AcousticDVBTReceiver',
+    'iq_to_wav', 'wav_to_iq',
+    
+    # Image Transport
+    'ImagePacketizer', 'ImageDepacketizer',
+    'image_to_ts', 'ts_to_image',
+    'send_image_audio', 'receive_image_audio',
     
     # Main
     'DVBTModulator', 'DVBTDemodulator',

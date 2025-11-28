@@ -55,12 +55,16 @@ class DVBTModulator:
         Initialize DVB-T modulator.
         
         Args:
-            mode: OFDM mode ('2K' or '8K')
+            mode: OFDM mode ('2K', '8K', or 'audio')
             constellation: Modulation ('QPSK', '16QAM', '64QAM')
             code_rate: FEC rate ('1/2', '2/3', '3/4', '5/6', '7/8')
             guard_interval: Guard interval ('1/4', '1/8', '1/16', '1/32')
-            bandwidth: Channel bandwidth ('6MHz', '7MHz', '8MHz')
+            bandwidth: Channel bandwidth ('6MHz', '7MHz', '8MHz', or 'audio')
         """
+        # Handle audio mode: if bandwidth is 'audio', force mode to 'audio'
+        if bandwidth == 'audio':
+            mode = 'audio'
+        
         self.mode = mode
         self.constellation = constellation
         self.code_rate = code_rate
@@ -96,6 +100,11 @@ class DVBTModulator:
             self.constellation, self.code_rate
         )
     
+    # Outer interleaver fill delay: I * (I-1) * M / 2 * 2 = I * (I-1) * M
+    # With I=12, M=17: 12 * 11 * 17 = 2244 bytes
+    # We need ~12 packets of padding to flush the pipeline
+    INTERLEAVER_FLUSH_PACKETS = 12
+    
     def modulate(self, ts_data: Union[bytes, bytearray, 
                                        TransportStream]) -> np.ndarray:
         """
@@ -117,6 +126,15 @@ class DVBTModulator:
             return np.array([], dtype=np.complex64)
         
         ts_data = ts_data[:num_packets * PACKET_SIZE]
+        
+        # For audio mode, add padding packets to flush the outer interleaver
+        # The interleaver has a fill delay of ~2244 bytes, so we add 12 null packets
+        if self.mode == 'audio':
+            # Create null TS packets (sync byte 0x47, then zeros, PID 0x1FFF = null)
+            null_packet = bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes(184)
+            padding = null_packet * self.INTERLEAVER_FLUSH_PACKETS
+            ts_data = ts_data + padding
+            num_packets += self.INTERLEAVER_FLUSH_PACKETS
         
         # Stage 1: Energy dispersal (scrambling)
         scrambled = self.scrambler.scramble(ts_data)
@@ -244,6 +262,10 @@ class DVBTModulator:
         Returns:
             Sample rate
         """
+        # For audio mode, OFDM runs at 16 kHz (upsampled to 48kHz for audio output)
+        if self.mode == 'audio' or self.bandwidth == 'audio':
+            return 16000.0
+        
         sample_rates = {
             '8MHz': 9142857.142857143,
             '7MHz': 8000000.0,
@@ -295,19 +317,26 @@ class DVBTDemodulator:
                  code_rate: str = '1/2', guard_interval: str = '1/4',
                  bandwidth: str = '8MHz',
                  equalization: str = 'zf',
-                 soft_decision: bool = False):
+                 soft_decision: bool = False,
+                 progress_callback: callable = None):
         """
         Initialize DVB-T demodulator.
         
         Args:
-            mode: OFDM mode ('2K', '8K', or 'auto')
+            mode: OFDM mode ('2K', '8K', 'audio', or 'auto')
             constellation: Expected modulation
             code_rate: Expected FEC rate
             guard_interval: Expected guard interval
-            bandwidth: Channel bandwidth for sample rate
+            bandwidth: Channel bandwidth for sample rate ('6MHz', '7MHz', '8MHz', 'audio')
             equalization: Equalization method ('zf' or 'mmse')
             soft_decision: Use soft decision decoding
+            progress_callback: Optional callback(symbols_done, total_symbols, phase) for progress updates
         """
+        self.progress_callback = progress_callback
+        # Handle audio mode: if bandwidth is 'audio', force mode to 'audio'
+        if bandwidth == 'audio':
+            mode = 'audio'
+        
         self.mode = mode
         self.constellation = constellation
         self.code_rate = code_rate
@@ -321,6 +350,7 @@ class DVBTDemodulator:
             '8MHz': 9142857.142857143,
             '7MHz': 8000000.0,
             '6MHz': 6857142.857142857,
+            'audio': 16000.0,  # OFDM sample rate (upsampled to 48kHz for audio)
         }
         self.sample_rate = sample_rates.get(bandwidth, sample_rates['8MHz'])
         
@@ -339,7 +369,7 @@ class DVBTDemodulator:
         from .ChannelEstimator import ChannelEstimatorWithEqualization
         
         # FFT parameters
-        fft_sizes = {'2K': 2048, '8K': 8192}
+        fft_sizes = {'2K': 2048, '8K': 8192, 'audio': 64}
         self.fft_size = fft_sizes[self.mode]
         
         # Synchronization
@@ -450,6 +480,9 @@ class DVBTDemodulator:
         all_data = []
         self.channel_eq.reset()
         
+        # Symbols per frame depends on mode
+        symbols_per_frame = 16 if self.mode == 'audio' else 68
+        
         for sym_idx in range(num_symbols):
             start = sym_idx * symbol_len
             symbol_samples = aligned_samples[start:start + symbol_len]
@@ -461,18 +494,22 @@ class DVBTDemodulator:
             carriers = self.ofdm_demod.demodulate(useful)
             
             # Channel estimation and equalization
-            equalized, csi = self.channel_eq.process(carriers, sym_idx % 68)
+            equalized, csi = self.channel_eq.process(carriers, sym_idx % symbols_per_frame)
             
             # Fine frequency/phase correction using pilots
-            fine_cfo, phase = self.synchronizer.refine_sync(equalized, sym_idx % 68)
+            fine_cfo, phase = self.synchronizer.refine_sync(equalized, sym_idx % symbols_per_frame)
             equalized = self.synchronizer.fine.correct_phase(equalized, phase)
             
             # Extract data carriers (remove pilots)
             data_carriers, _, _ = self.pilot_extractor.extract(
-                equalized, sym_idx % 68
+                equalized, sym_idx % symbols_per_frame
             )
             
             all_data.append(data_carriers)
+            
+            # Progress callback for real-time updates
+            if self.progress_callback and sym_idx % 50 == 0:
+                self.progress_callback(sym_idx + 1, num_symbols, 'symbols')
         
         # Concatenate all data carriers
         data_carriers = np.concatenate(all_data)
@@ -509,6 +546,13 @@ class DVBTDemodulator:
         
         # Step 8: Outer deinterleaving
         deinterleaved = self.outer_deinterleaver.process(byte_data)
+        
+        # For audio mode, skip the interleaver fill delay
+        # The fill produces ~2244 bytes of zeros at the start
+        # Skip first 11 RS codewords (11 * 204 = 2244 bytes)
+        if self.mode == 'audio':
+            interleaver_fill = 11 * 204  # Skip first 11 RS blocks worth
+            deinterleaved = deinterleaved[interleaver_fill:]
         
         # Step 9: RS decoding
         recovered = bytearray()
@@ -576,7 +620,7 @@ class DVBTDemodulator:
             self._auto_detect_params(iq_samples)
         
         symbol_len = self.fft_size + self.guard_remover.guard_length
-        symbols_per_frame = 68
+        symbols_per_frame = 16 if self.mode == 'audio' else 68
         samples_per_frame = symbol_len * symbols_per_frame
         samples_per_chunk = samples_per_frame * frames_per_chunk
         
@@ -600,6 +644,7 @@ class DVBTDemodulator:
         
         symbol_len = self.fft_size + self.guard_remover.guard_length
         num_symbols = len(samples) // symbol_len
+        symbols_per_frame = 16 if self.mode == 'audio' else 68
         
         if num_symbols == 0:
             return b'', stats
@@ -608,7 +653,7 @@ class DVBTDemodulator:
         all_data = []
         
         for sym_idx in range(num_symbols):
-            frame_sym_idx = (start_symbol + sym_idx) % 68
+            frame_sym_idx = (start_symbol + sym_idx) % symbols_per_frame
             start = sym_idx * symbol_len
             symbol_samples = samples[start:start + symbol_len]
             
